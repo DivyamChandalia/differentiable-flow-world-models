@@ -184,6 +184,12 @@ class ActorLoss(nn.Module):
         if len(entropy.shape) < len(targets.shape):
             entropy = entropy.unsqueeze(-1)
 
+        if self.batch_first:
+            targets = targets.transpose(0, 1)
+            entropy = entropy.transpose(0, 1)
+            if pcont is not None:
+                pcont = pcont.transpose(0, 1)
+
         actor_loss = -(targets + self.entropy_scale * entropy)
 
         if pcont is None:
@@ -194,19 +200,11 @@ class ActorLoss(nn.Module):
                 dtype=targets.dtype, device=targets.device
             ).reshape(H, 1, 1)
         else:
-            if self.batch_first:
-                # Transpose to [H, B, 1]
-                pcont = pcont.transpose(0, 1)
-                
             H, B, _ = targets.shape
             # discount_weights[t] = gamma^t * \prod_{i=0}^{t-1} pcont[i]
             ones = torch.ones(1, B, 1, dtype=pcont.dtype, device=pcont.device)
             discounts = torch.cat([ones, self.discount * pcont[:-1]], dim=0)
             discount_weights = torch.cumprod(discounts, dim=0)
-            
-            if self.batch_first:
-                # Transpose back if necessary
-                discount_weights = discount_weights.transpose(0, 1)
 
         actor_loss = discount_weights * actor_loss
 

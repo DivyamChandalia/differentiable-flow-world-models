@@ -4,34 +4,6 @@ from transformers import MobileViTConfig, MobileViTModel
 from .common import SwiGLUMLP, init_linear_orthogonal
 import numpy as np
 
-# class VisionEncoder(nn.Module):
-#     def __init__(self, latent_dim, hidden_dim, model="apple/mobilevit-xx-small"):
-#         super().__init__()
-#         self.config = MobileViTConfig.from_pretrained(model)
-#         self.backbone = MobileViTModel(self.config)
-#         in_features = getattr(self.config, "last_hidden_dim", 320)
-        
-#         self.projection = SwiGLUMLP(
-#             input_dim=in_features,
-#             hidden_dim=hidden_dim,
-#             output_dim=latent_dim,
-#             norm_fn=nn.BatchNorm1d
-#         )
-
-#         self.norm = nn.LayerNorm(latent_dim)
-        
-#     def forward(self, x):
-#         outputs = self.backbone(x)
-#         pooled_output = outputs.pooler_output
-        
-#         projected_output = self.projection(pooled_output)
-
-#         projected_output = self.norm(projected_output)
-        
-#         return projected_output
-
-import torch
-import torch.nn as nn
 
 class VisionEncoder(nn.Module):
     def __init__(self, latent_dim, hidden_dim, in_channels=3, img_size=224):

@@ -540,7 +540,7 @@ class Trainer:
                 target_imagined_values = self.target_value_model(history_windows)
                 
             pred_term_probs = torch.sigmoid(imagined_terminals)
-            pcont = 1.0 - pred_term_probs
+            pcont = (1.0 - pred_term_probs).detach()
             
             v_loss, targets = self.value_loss_fn(
                 imagined_values, 
