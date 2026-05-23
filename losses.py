@@ -135,16 +135,19 @@ class ValueLoss(nn.Module):
         G_t = r_t + gamma * pcont_t * ((1 - lambda) * V_{t+1} + lambda * G_{t+1})
         """
         H, B, _ = rewards.shape
-        targets = torch.empty_like(rewards)
+        targets_list = []
         
         next_target = values[-1] 
         
         for t in reversed(range(H)):
-            targets[t] = rewards[t] + self.discount * pcont[t] * (
+            target_t = rewards[t] + self.discount * pcont[t] * (
                 (1.0 - self.lambda_) * values[t + 1] + self.lambda_ * next_target
             )
-            next_target = targets[t]
+            targets_list.append(target_t)
+            next_target = target_t
             
+        targets_list.reverse()
+        targets = torch.stack(targets_list, dim=0)
         return targets
     
 class ActorLoss(nn.Module):
@@ -197,10 +200,8 @@ class ActorLoss(nn.Module):
                 
             H, B, _ = targets.shape
             # discount_weights[t] = gamma^t * \prod_{i=0}^{t-1} pcont[i]
-            # We initialize a tensor of shape [H, B, 1] with 1.0 (since cum_pcont_0 = 1.0)
-            discounts = torch.ones(H, B, 1, dtype=pcont.dtype, device=pcont.device)
-            # For t >= 1, the discount multiplier is gamma * pcont[t-1]
-            discounts[1:] = self.discount * pcont[:-1]
+            ones = torch.ones(1, B, 1, dtype=pcont.dtype, device=pcont.device)
+            discounts = torch.cat([ones, self.discount * pcont[:-1]], dim=0)
             discount_weights = torch.cumprod(discounts, dim=0)
             
             if self.batch_first:
