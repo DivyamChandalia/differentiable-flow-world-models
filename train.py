@@ -18,12 +18,7 @@ import torchvision
 from models.world import World
 import os
 from datetime import datetime
-
-def symlog(x):
-    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
-
-def symexp(x):
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+from models.common import symlog, symexp
 
 @dataclass
 class Config:
@@ -50,8 +45,8 @@ class Config:
     world_agent_ratio: float = 1.0  
     
     world_lr: float = 1e-3
-    actor_lr: float = 3e-6
-    value_lr: float = 3e-6
+    actor_lr: float = 8e-5
+    value_lr: float = 8e-5
     grad_clip_norm: float = 100.0
     use_amp: bool = True 
     amp_dtype: str = 'bfloat16' 
@@ -493,7 +488,8 @@ class Trainer:
             # Seed the actor history with the real context frames
             imagined_history = list(ctx_windows.unbind(dim=1))  # list of ctx tensors (batch_size, D)
 
-            for step in range(self.cfg.agent_horizon):
+            imagination_steps = self.cfg.world_horizon - self.cfg.imagination_ctx_frames
+            for step in range(imagination_steps):
                 # Construct history window for the current step
                 history_list = list(imagined_history)
                 while len(history_list) < self.cfg.agent_horizon:
@@ -542,15 +538,22 @@ class Trainer:
             pred_term_probs = torch.sigmoid(imagined_terminals)
             pcont = (1.0 - pred_term_probs).detach()
             
-            v_loss, targets = self.value_loss_fn(
+            v_loss, targets_v = self.value_loss_fn(
                 imagined_values, 
                 imagined_rewards, 
                 pcont=pcont, 
                 target_values=target_imagined_values
             )
 
+            # Compute actor targets using the online value function (with gradients)
+            targets_a = self.value_loss_fn._compute_lambda_returns(
+                imagined_values,
+                imagined_rewards,
+                pcont
+            )
+
             rollout_dist = self.actor.get_distribution(history_windows[:-1].detach())
-            a_loss, entropy = self.actor_loss_fn(targets, rollout_dist, pcont=pcont)
+            a_loss, entropy = self.actor_loss_fn(targets_a, rollout_dist, pcont=pcont)
 
         self.value_opt.zero_grad(set_to_none=True)
         self.actor_opt.zero_grad(set_to_none=True)

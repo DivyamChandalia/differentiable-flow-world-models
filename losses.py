@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.common import symlog, symexp
 
 class SIGReg(nn.Module):
     """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
@@ -134,21 +135,24 @@ class ValueLoss(nn.Module):
         The formula:
         G_t = r_t + gamma * pcont_t * ((1 - lambda) * V_{t+1} + lambda * G_{t+1})
         """
+        raw_values = symexp(values)
+        raw_rewards = symexp(rewards)
+        
         H, B, _ = rewards.shape
         targets_list = []
         
-        next_target = values[-1] 
+        next_target = raw_values[-1] 
         
         for t in reversed(range(H)):
-            target_t = rewards[t] + self.discount * pcont[t] * (
-                (1.0 - self.lambda_) * values[t + 1] + self.lambda_ * next_target
+            target_t = raw_rewards[t] + self.discount * pcont[t] * (
+                (1.0 - self.lambda_) * raw_values[t + 1] + self.lambda_ * next_target
             )
             targets_list.append(target_t)
             next_target = target_t
             
         targets_list.reverse()
         targets = torch.stack(targets_list, dim=0)
-        return targets
+        return symlog(targets)
     
 class ActorLoss(nn.Module):
     def __init__(self, entropy_scale=1e-4, discount=0.99, batch_first=False):

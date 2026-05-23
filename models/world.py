@@ -69,9 +69,9 @@ class World(nn.Module):
             curr_action = action_embedding[:, -1:]
 
             # Stop gradients of states and KV cache flowing back in time
-            # self.latest_state = self.latest_state.detach()
+            self.latest_state = self.latest_state.detach()
             if self.current_kv_cache is not None:
-                # self.current_kv_cache = [(k.detach(), v.detach()) for k, v in self.current_kv_cache]
+                self.current_kv_cache = [(k.detach(), v.detach()) for k, v in self.current_kv_cache]
 
                 # Sliding window: evict the oldest token if we are at the horizon limit.
                 # This keeps start_pos + 1 <= self.horizon so RoPE freqs_cis never goes

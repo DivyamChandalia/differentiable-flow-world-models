@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def symlog(x):
+    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
+def symexp(x):
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     """
