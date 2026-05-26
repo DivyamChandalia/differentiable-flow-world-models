@@ -12,6 +12,10 @@ class World(nn.Module):
         self.decoder = decoder
         self.latest_state = None
         self.horizon = horizon
+        
+        # Learnable sequence of placeholders acting as positional state embeddings
+        state_dim = reward.mlp.up_proj.in_features
+        self.state_placeholder = nn.Parameter(torch.randn(1, self.horizon, state_dim) * 0.02)
 
     def forward(self, actions, observations):
         '''
@@ -94,6 +98,40 @@ class World(nn.Module):
         terminal = self.termination(self.latest_state.squeeze(1))
 
         return self.latest_state, reward, terminal
+
+    def generate_chunk(self, actions, start_states):
+        '''
+        actions: (B, T_act, Action space) - where T_act = ctx - 1 + chunk_size
+        start_states: (B, ctx, Latent)
+        '''
+        B, T_act, AS = actions.shape
+        action_embedding = self.action(actions.reshape(B * T_act, AS)).reshape(B, T_act, -1)
+        
+        ctx = start_states.size(1)
+        chunk_size = T_act - ctx + 1
+        
+        # Sliced and expanded learnable positional placeholders
+        repeated_placeholder = self.state_placeholder[:, :chunk_size - 1].expand(B, -1, -1)
+        x_input = torch.cat([start_states, repeated_placeholder], dim=1) # (B, ctx - 1 + chunk_size, D)
+        
+        # 1-step parallel generation pass
+        out_states = self.dynamics(x_input, action_embedding, kv_cache=None) # (B, ctx - 1 + chunk_size, D)
+        
+        # Extract imagined states (predictions for steps ctx ... ctx - 1 + chunk_size)
+        imagined_states = out_states[:, ctx - 1:] # (B, chunk_size, D)
+        
+        # Prepend the starting state to get chunk_size + 1 states
+        all_states = torch.cat([start_states[:, -1:], imagined_states], dim=1) # (B, chunk_size + 1, D)
+        
+        # Transpose to (Seq, B, D) format
+        all_states_seq = all_states.transpose(0, 1) # (chunk_size + 1, B, D)
+        imagined_states_seq = imagined_states.transpose(0, 1) # (chunk_size, B, D)
+        
+        # Predict rewards and terminals
+        rewards = self.reward(imagined_states_seq) # (chunk_size, B, 1)
+        terminals = self.termination(imagined_states_seq) # (chunk_size, B, 1)
+        
+        return all_states_seq, rewards, terminals
 
     def freeze(self):
         for param in self.parameters():
@@ -204,7 +242,7 @@ if __name__ == "__main__":
         
         action, log_prob, _ = actor(current_latent)
         
-        action_seq = action.unsqueeze(1)
+        action_seq = action[:, -1].unsqueeze(1)
         _, predicted_reward, predicted_terminal = world.step_world(action_seq)
         
         state_value = value(world.latest_state.squeeze(1))

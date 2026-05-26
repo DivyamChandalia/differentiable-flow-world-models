@@ -48,10 +48,15 @@ def worker(remote, parent_remote, env_fn):
                 break
     except KeyboardInterrupt:
         print("Worker KeyboardInterrupt")
+    except (EOFError, ConnectionResetError):
+        pass
     except Exception as e:
-        print(f"Worker Error: {e}")
+        import traceback
+        print(f"Worker Error ({type(e).__name__}): {e}")
+        traceback.print_exc()
     finally:
-        env.close()
+        if 'env' in locals():
+            env.close()
 
 class SubprocVecEnv:
     """Lightweight, safe multiprocessing wrapper for gym environments."""
@@ -96,4 +101,5 @@ class SubprocVecEnv:
 
 def make_env(domain, task, seed, height, width):
     """Top-level function for pickling safely across OSs."""
-    return DMCGym(domain=domain, task=task, task_kwargs={'random': seed}, height=height, width=width)
+    camera_id = 1 if domain == 'cartpole' else 0
+    return DMCGym(domain=domain, task=task, task_kwargs={'random': seed}, height=height, width=width, camera_id=camera_id)

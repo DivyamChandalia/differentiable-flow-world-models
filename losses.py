@@ -80,11 +80,12 @@ class WeakSIGReg(nn.Module):
 
 class ValueLoss(nn.Module):
 
-    def __init__(self, discount=0.99, lambda_=0.95, batch_first=False):
+    def __init__(self, discount=0.99, lambda_=0.99, batch_first=False, use_symlog=True):
         super().__init__()
         self.discount = discount
         self.lambda_ = lambda_
         self.batch_first = batch_first
+        self.use_symlog = use_symlog
 
     def forward(self, values, rewards, pcont=None, target_values=None):
         """
@@ -135,8 +136,12 @@ class ValueLoss(nn.Module):
         The formula:
         G_t = r_t + gamma * pcont_t * ((1 - lambda) * V_{t+1} + lambda * G_{t+1})
         """
-        raw_values = symexp(values)
-        raw_rewards = symexp(rewards)
+        if self.use_symlog:
+            raw_values = symexp(values)
+            raw_rewards = symexp(rewards)
+        else:
+            raw_values = values
+            raw_rewards = rewards
         
         H, B, _ = rewards.shape
         targets_list = []
@@ -152,7 +157,10 @@ class ValueLoss(nn.Module):
             
         targets_list.reverse()
         targets = torch.stack(targets_list, dim=0)
-        return symlog(targets)
+        
+        if self.use_symlog:
+            return symlog(targets)
+        return targets
     
 class ActorLoss(nn.Module):
     def __init__(self, entropy_scale=1e-4, discount=0.99, batch_first=False):

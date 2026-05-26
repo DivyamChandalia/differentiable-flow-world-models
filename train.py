@@ -19,6 +19,9 @@ from models.world import World
 import os
 from datetime import datetime
 from models.common import symlog, symexp
+from torchvision.transforms.functional import to_pil_image, to_tensor
+from PIL import Image, ImageDraw
+from torch.distributions import Normal
 
 @dataclass
 class Config:
@@ -54,9 +57,12 @@ class Config:
     
     sigreg_weight: float = 0.1
     weak_sigreg: bool = True     # if True, use WeakSIGReg (Frobenius cov loss) instead of SIGReg
-    entropy_scale: float = 0.0
+    entropy_scale: float = 1e-4
     discount: float = 0.99
-    
+    actor_num_blocks: int = 4
+    value_num_blocks: int = 4
+    use_symlog: bool = True
+
     buffer_capacity: int = 150
     prefill_episodes: int = 50
     world_bootstrap_steps: int = 250  # extra WM-only gradient steps run after prefill, before training loop
@@ -110,6 +116,7 @@ class Trainer:
         self.cfg = cfg
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device} with {cfg.num_envs} parallel environments.")
+        self.set_seed(cfg.seed)
         
         env_fns = [
             partial(make_env, cfg.domain, cfg.task, cfg.seed + i, cfg.image_size, cfg.image_size) 
@@ -122,7 +129,7 @@ class Trainer:
         
         vision = VisionEncoder(latent_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         action_enc = ActionEncoder(action_space=self.envs.get_action_space(), hidden_dim=cfg.hidden_dim, output_dim=cfg.latent_dim)
-        dynamics = Dynamics(max_frames=cfg.max_frames, action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim, 
+        dynamics = Dynamics(max_frames=cfg.max_frames + cfg.imagination_ctx_frames, action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim, 
                             num_layers=cfg.dyn_num_layers, num_heads=cfg.dyn_num_heads)
         reward_enc = Reward(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         termination_enc = Termination(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
@@ -133,9 +140,9 @@ class Trainer:
             decoder = None
             
         self.world = World(vision, dynamics, action_enc, reward_enc, termination_enc, self.cfg.world_horizon, decoder=decoder).to(self.device)
-        self.actor = Actor(action_space=self.envs.get_action_space(), obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim).to(self.device)
-        self.value_model = Value(obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim).to(self.device)
-        self.target_value_model = Value(obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim).to(self.device)
+        self.actor = Actor(action_space=self.envs.get_action_space(), obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim, chunk_size=cfg.world_horizon, num_blocks=cfg.actor_num_blocks).to(self.device)
+        self.value_model = Value(obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
+        self.target_value_model = Value(obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
         self.target_value_model.load_state_dict(self.value_model.state_dict())
         self.target_value_model.eval()
         for p in self.target_value_model.parameters():
@@ -145,7 +152,7 @@ class Trainer:
             self.sig_reg = WeakSIGReg().to(self.device)
         else:
             self.sig_reg = SIGReg().to(self.device)
-        self.value_loss_fn = ValueLoss(discount=cfg.discount, batch_first=False)
+        self.value_loss_fn = ValueLoss(discount=cfg.discount, batch_first=False, use_symlog=cfg.use_symlog)
         self.actor_loss_fn = ActorLoss(discount=cfg.discount, batch_first=False, entropy_scale=cfg.entropy_scale)
         
         self.world_opt = optim.Adam(self.world.parameters(), lr=cfg.world_lr)
@@ -162,6 +169,68 @@ class Trainer:
         self.agent_step = 0
         self.world_step = 0
 
+    def set_seed(self, seed):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    def draw_action_indicator(self, frame, action_array):
+        img = Image.fromarray(frame)
+        draw = ImageDraw.Draw(img)
+        
+        num_actions = len(action_array)
+        bar_width = 180
+        bar_left = (256 - bar_width) // 2
+        bar_right = bar_left + bar_width
+        bar_center = 256 // 2
+        
+        bar_thickness = 4
+        dot_radius = 6
+        
+        for d in range(num_actions):
+            y_center = 230 - d * 16
+            
+            # Draw background bar
+            draw.rounded_rectangle(
+                [bar_left, y_center - bar_thickness // 2, bar_right, y_center + bar_thickness // 2],
+                radius=bar_thickness // 2,
+                fill=(100, 100, 100)
+            )
+            
+            # Draw center tick
+            draw.rectangle(
+                [bar_center - 1, y_center - 4, bar_center + 1, y_center + 4],
+                fill=(255, 255, 255)
+            )
+            
+            # Calculate dot position
+            act_val = np.clip(action_array[d], -1.0, 1.0)
+            x_dot = bar_center + int(act_val * (bar_width // 2))
+            
+            # Draw dot (Cyan indicator with black outline)
+            draw.ellipse(
+                [x_dot - dot_radius - 1, y_center - dot_radius - 1, x_dot + dot_radius + 1, y_center + dot_radius + 1],
+                fill=(0, 0, 0)
+            )
+            draw.ellipse(
+                [x_dot - dot_radius, y_center - dot_radius, x_dot + dot_radius, y_center + dot_radius],
+                fill=(0, 220, 255)
+            )
+            
+            # Draw label
+            label = f"a{d}"
+            label_x, label_y = bar_left - 20, y_center - 6
+            for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
+                draw.text((label_x + dx, label_y + dy), label, fill=(0, 0, 0))
+            draw.text((label_x, label_y), label, fill=(255, 255, 255))
+            
+        return np.array(img)
+
     def _compute_grad_norm(self, model):
         total_norm = 0.0
         for p in model.parameters():
@@ -175,11 +244,16 @@ class Trainer:
             for p, p_target in zip(self.value_model.parameters(), self.target_value_model.parameters()):
                 p_target.copy_(self.cfg.value_target_tau * p + (1.0 - self.cfg.value_target_tau) * p_target)
     
-    def _get_history_windows(self, states, horizon):
+    def _get_history_windows(self, states, horizon, context=None):
         # states shape: (Seq, B, D)
         Seq, B, D = states.shape
-        s0 = states[0:1]
-        padded = torch.cat([s0.repeat(horizon - 1, 1, 1), states], dim=0)
+        if context is not None:
+            ctx_states = context.transpose(0, 1) # (ctx, B, D)
+            ctx_feed = ctx_states[-horizon:-1] # (horizon - 1, B, D)
+            padded = torch.cat([ctx_feed, states], dim=0)
+        else:
+            s0 = states[0:1]
+            padded = torch.cat([s0.repeat(horizon - 1, 1, 1), states], dim=0)
         windows = padded.unfold(dimension=0, size=horizon, step=1) # (Seq, B, D, horizon)
         return windows.permute(0, 1, 3, 2).reshape(Seq, B, horizon * D)
     
@@ -214,7 +288,6 @@ class Trainer:
         while step < max_steps and active_envs.any():
             if render and not is_vectorized:
                 frame = env.render(height=256, width=256)
-                frames.append(frame)
                 
             obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=self.device) / 255.0
             
@@ -230,6 +303,7 @@ class Trainer:
                 actor_input = torch.stack(history_list, dim=1).reshape(num_envs, -1)
                 
                 actions, _, _ = self.actor(actor_input, deterministic=deterministic)
+                actions = actions[:, 0]
                 
             actions_np = actions.cpu().numpy()
             if not is_vectorized:
@@ -238,6 +312,11 @@ class Trainer:
                 action_np = np.clip(action_np, -1.0, 1.0)
                 actions_np[0] = action_np
                 
+            if render and not is_vectorized:
+                frame = self.draw_action_indicator(frame, actions_np[0])
+                frames.append(frame)
+                
+            if not is_vectorized:
                 res = env.step(action_np)
                 if len(res) == 4:
                     next_obs, reward, done, info = res
@@ -297,7 +376,7 @@ class Trainer:
 
     def evaluate(self, epoch, max_steps=250):
         """Runs a single deterministic episode to evaluate and log a video."""
-        mean_return, _, frames = self.rollout(
+        mean_return, ep_len, frames = self.rollout(
             env=self.val_env, 
             deterministic=True, 
             max_steps=max_steps, 
@@ -305,6 +384,7 @@ class Trainer:
             add_to_buffer=False
         )
         self.writer.add_scalar('Validation/Return', mean_return, epoch)
+        self.writer.add_scalar('Validation/Episode_Length', ep_len, epoch)
         
         video_array = np.array(frames)
         video_tensor = torch.tensor(video_array, dtype=torch.uint8).permute(0, 3, 1, 2).unsqueeze(0)
@@ -314,7 +394,10 @@ class Trainer:
 
     def train_world(self, batch):
         obs_batch, act_batch, rew_batch, term_batch = [b.to(self.device, non_blocking=True) for b in batch]
-        sym_rew_batch = symlog(rew_batch)
+        if self.cfg.use_symlog:
+            sym_rew_batch = symlog(rew_batch)
+        else:
+            sym_rew_batch = rew_batch
         
         self.world.unfreeze()
         
@@ -404,24 +487,73 @@ class Trainer:
         self.writer.add_scalar('GradNorm/World_Reward', rew_grad_norm, self.world_step)
         
         if self.cfg.recon_debug and (self.world_step % self.cfg.train_steps == 0):
-            self.visualize_reconstruction(obs_batch, recon_obs, recon_pred_obs)
+            self.visualize_reconstruction(obs_batch, recon_obs, recon_pred_obs, raw_states, pred_next_state)
             
         self.world_step += 1
         
         return raw_states.detach(), act_batch.detach(), wm_loss.item()
 
     @torch.no_grad()
-    def visualize_reconstruction(self, obs_batch, recon_obs, recon_pred_obs):
-        actual = obs_batch[0].detach().cpu()
-        encoded = recon_obs[0].detach().cpu()
-        pred = recon_pred_obs[0].detach().cpu()
+    def visualize_reconstruction(self, obs_batch, recon_obs, recon_pred_obs, raw_states, pred_next_state):
+        
+        idx = random.randint(0, obs_batch.size(0) - 1)
+        actual = obs_batch[idx].detach().cpu()
+        encoded = recon_obs[idx].detach().cpu()
+        pred = recon_pred_obs[idx].detach().cpu()
         
         zero_img = torch.zeros_like(encoded[:1])
         pred_aligned = torch.cat([zero_img, pred], dim=0)
+
+        # Calculate predicted values for encoded and predicted states
+        states_idx = raw_states[idx:idx+1].transpose(0, 1) # (T, 1, D)
+        enc_windows = self._get_history_windows(states_idx, self.cfg.agent_horizon, context=None) # (T, 1, agent_horizon * D)
+        with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+            enc_vals_raw = self.value_model(enc_windows)
+            if self.cfg.use_symlog:
+                enc_vals_raw = symexp(enc_vals_raw)
+            enc_values = enc_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy() # shape (T,)
+
+        pred_states_idx = torch.cat([raw_states[idx:idx+1, 0:1], pred_next_state[idx:idx+1]], dim=1).transpose(0, 1) # (T, 1, D)
+        pred_windows = self._get_history_windows(pred_states_idx, self.cfg.agent_horizon, context=None) # (T, 1, agent_horizon * D)
+        with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+            pred_vals_raw = self.value_model(pred_windows)
+            if self.cfg.use_symlog:
+                pred_vals_raw = symexp(pred_vals_raw)
+            pred_values = pred_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy() # shape (T,)
+
+        # Draw values on encoded frames
+        encoded_with_val = []
+        for t in range(encoded.size(0)):
+            val = enc_values[t]
+            frame = encoded[t].float()
+            img_pil = to_pil_image(frame)
+            draw = ImageDraw.Draw(img_pil)
+            text = f"v:{val:.2f}"
+            x, y = 2, 2
+            for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
+                draw.text((x + dx, y + dy), text, fill="black")
+            draw.text((x, y), text, fill="white")
+            encoded_with_val.append(to_tensor(img_pil))
+        encoded_with_val = torch.stack(encoded_with_val, dim=0)
+
+        # Draw values on predicted frames
+        pred_aligned_with_val = []
+        for t in range(pred_aligned.size(0)):
+            val = pred_values[t]
+            frame = pred_aligned[t].float()
+            img_pil = to_pil_image(frame)
+            draw = ImageDraw.Draw(img_pil)
+            text = f"v:{val:.2f}"
+            x, y = 2, 2
+            for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
+                draw.text((x + dx, y + dy), text, fill="black")
+            draw.text((x, y), text, fill="white")
+            pred_aligned_with_val.append(to_tensor(img_pil))
+        pred_aligned_with_val = torch.stack(pred_aligned_with_val, dim=0)
         
         grid_actual = torchvision.utils.make_grid(actual, nrow=actual.size(0), normalize=False)
-        grid_encoded = torchvision.utils.make_grid(encoded, nrow=encoded.size(0), normalize=False)
-        grid_pred = torchvision.utils.make_grid(pred_aligned, nrow=pred_aligned.size(0), normalize=False)
+        grid_encoded = torchvision.utils.make_grid(encoded_with_val, nrow=encoded_with_val.size(0), normalize=False)
+        grid_pred = torchvision.utils.make_grid(pred_aligned_with_val, nrow=pred_aligned_with_val.size(0), normalize=False)
         
         combined_grid = torch.cat([grid_actual, grid_encoded, grid_pred], dim=1)
         self.writer.add_image('Reconstruction/Actual_vs_Encoded_vs_Predicted', combined_grid, self.world_step)
@@ -477,59 +609,36 @@ class Trainer:
             for b, t in zip(batch_indices.tolist(), time_indices.tolist())
         ], dim=0)  # (batch_size, ctx-1, A)
 
-        imagined_states = [ctx_windows[:, -1]]   # track imagined states (starting from last ctx frame)
-        imagined_rewards = []
-        imagined_terminals = []
-
         self.world.reset_cache()
 
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
 
             # Seed the actor history with the real context frames
-            imagined_history = list(ctx_windows.unbind(dim=1))  # list of ctx tensors (batch_size, D)
+            history_list = list(ctx_windows.unbind(dim=1))
+            while len(history_list) < self.cfg.agent_horizon:
+                history_list.insert(0, history_list[0])
+            history_list = history_list[-self.cfg.agent_horizon:]
 
-            imagination_steps = self.cfg.world_horizon - self.cfg.imagination_ctx_frames
-            for step in range(imagination_steps):
-                # Construct history window for the current step
-                history_list = list(imagined_history)
-                while len(history_list) < self.cfg.agent_horizon:
-                    history_list.insert(0, history_list[0])
-                history_list = history_list[-self.cfg.agent_horizon:]
+            actor_input = torch.stack(history_list, dim=1).reshape(self.cfg.batch_size, -1)
 
-                actor_input = torch.stack(history_list, dim=1).reshape(self.cfg.batch_size, -1)
+            # Get action chunk and its distribution
+            rollout_dist = self.actor.get_distribution(actor_input)
+            action_chunk = rollout_dist.rsample() # (batch_size, H, A)
+            
+            # Apply tanh and scale/bias to match actor.forward behaviour
+            y = torch.tanh(action_chunk)
+            action_chunk_scaled = y * self.actor.action_scale + self.actor.action_bias
 
-                action, _, _ = self.actor(actor_input, deterministic=False)
-                action_seq = action.unsqueeze(1)   # (batch_size, 1, A)
+            ctx_actions_real = ctx_action_windows.to(device=self.device, dtype=action_chunk_scaled.dtype)
+            actions_full = torch.cat([ctx_actions_real, action_chunk_scaled], dim=1) # (batch_size, ctx - 1 + H, A)
 
-                if step == 0:
-                    # First step: prime the KV cache with the real (state, action) context.
-                    # Layout passed to dynamics — same seq length for states and actions:
-                    #   states:  [s_t, s_{t+1}, ..., s_{t+ctx-1}]          (ctx frames)
-                    #   actions: [a_t, a_{t+1}, ..., a_{t+ctx-2}, a_img]   (ctx-1 real + 1 imagined)
-                    # The dynamics predicts the next state for each position;
-                    # latest_state = prediction after the imagined action at s_{t+ctx-1}.
-                    ctx_actions_real = ctx_action_windows.to(
-                        device=self.device, dtype=action_seq.dtype
-                    )  # (batch_size, ctx-1, A)
-                    ctx_actions_full = torch.cat(
-                        [ctx_actions_real, action_seq], dim=1
-                    )  # (batch_size, ctx, A) — ctx-1 real + 1 imagined
-                    next_state, reward, terminal = self.world.step_world(
-                        actions=ctx_actions_full, start_states=ctx_windows
-                    )
-                else:
-                    next_state, reward, terminal = self.world.step_world(actions=action_seq)
+            # 1-step parallel generation pass
+            imagined_states, imagined_rewards, imagined_terminals = self.world.generate_chunk(
+                actions=actions_full,
+                start_states=ctx_windows
+            )
 
-                imagined_states.append(next_state.squeeze(1))
-                imagined_rewards.append(reward)
-                imagined_terminals.append(terminal)
-                imagined_history.append(next_state.squeeze(1))
-
-            imagined_states = torch.stack(imagined_states, dim=0)    # (H+1, batch_size, D)
-            imagined_rewards = torch.stack(imagined_rewards, dim=0)  # (H, batch_size, 1)
-            imagined_terminals = torch.stack(imagined_terminals, dim=0)  # (H, batch_size, 1)
-
-            history_windows = self._get_history_windows(imagined_states, self.cfg.agent_horizon)
+            history_windows = self._get_history_windows(imagined_states, self.cfg.agent_horizon, context=ctx_windows)
 
             imagined_values = self.value_model(history_windows)
             with torch.no_grad():
@@ -552,14 +661,20 @@ class Trainer:
                 pcont
             )
 
-            rollout_dist = self.actor.get_distribution(history_windows[:-1].detach())
-            a_loss, entropy = self.actor_loss_fn(targets_a, rollout_dist, pcont=pcont)
+            # Transpose distribution to match targets of shape (H, B, rollout_dist_trfrom torch.distributions import Normal1)
+            mean = rollout_dist.mean.transpose(0, 1) # (H, B, A)
+            std = rollout_dist.stddev.transpose(0, 1) # (H, B, A)
+            rollout_dist_transposed = Normal(mean, std)
+
+            a_loss, entropy = self.actor_loss_fn(targets_a, rollout_dist_transposed, pcont=pcont)
 
         self.value_opt.zero_grad(set_to_none=True)
         self.actor_opt.zero_grad(set_to_none=True)
 
         # Backward value loss first (updates value_model weights)
         self.scaler.scale(v_loss).backward(retain_graph=True)
+
+        self.actor_opt.zero_grad(set_to_none=True)
 
         # Temporarily freeze value model parameters to prevent actor loss from updating them
         for p in self.value_model.parameters():

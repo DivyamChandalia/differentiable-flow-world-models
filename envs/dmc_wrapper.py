@@ -143,9 +143,6 @@ class DMCGym(gym.Env):
         
         # 4. Gymnasium returns
         terminated = False
-        if self._domain == 'cartpole':
-            if abs(self._env.physics.cart_position()) >= 1.8:
-                terminated = True
                 
         truncated = timestep.last()
         info = {
