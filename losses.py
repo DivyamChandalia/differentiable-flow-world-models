@@ -177,21 +177,22 @@ class ActorLoss(nn.Module):
         self.discount = discount
         self.batch_first = batch_first
 
-    def forward(self, targets, dist, pcont=None):
+    def forward(self, targets, entropy, pcont=None):
         """
         Args:
             targets (torch.Tensor): Lambda-returns from ValueLoss.
                                    Shape: [H, B, 1] or [B, H, 1]
-            dist (torch.distributions.Distribution): The policy distribution.
-                Must support rsample() for analytical gradients.
+            entropy (torch.Tensor): Pre-computed entropy of the policy distribution.
+                                   Shape: [H, B, 1] or [B, H, 1]
             pcont (torch.Tensor, optional): Continuation probabilities.
                                    Shape: [H, B, 1] or [B, H, 1]
                                   
         Returns:
-            loss (torch.Tensor): Scalar loss to minimize.
+            loss (torch.Tensor): Scalar combined loss to minimize.
+            target_loss (torch.Tensor): Scalar loss from negative targets only.
+            entropy_loss (torch.Tensor): Scalar loss from negative entropy only.
             entropy (torch.Tensor): Mean entropy for logging.
         """
-        entropy = dist.entropy()
         
         if len(entropy.shape) < len(targets.shape):
             entropy = entropy.unsqueeze(-1)
@@ -201,8 +202,6 @@ class ActorLoss(nn.Module):
             entropy = entropy.transpose(0, 1)
             if pcont is not None:
                 pcont = pcont.transpose(0, 1)
-
-        actor_loss = -(targets + self.entropy_scale * entropy)
 
         if pcont is None:
             # Compute per-step discount weights gamma^t, shape [H, 1, 1]
@@ -218,6 +217,52 @@ class ActorLoss(nn.Module):
             discounts = torch.cat([ones, self.discount * pcont[:-1]], dim=0)
             discount_weights = torch.cumprod(discounts, dim=0)
 
-        actor_loss = discount_weights * actor_loss
+        target_loss = (-discount_weights * targets).mean()
+        entropy_loss = (-discount_weights * self.entropy_scale * entropy).mean()
+        combined_loss = target_loss + entropy_loss
 
-        return actor_loss.mean(), entropy.mean()
+        return combined_loss, target_loss, entropy_loss, entropy.mean()
+
+
+class ReturnEMA(nn.Module):
+    """
+    DreamerV3-style return normalization using exponential moving average
+    of percentiles. Tracks the 5th and 95th percentile of lambda-returns
+    and normalizes them to roughly [0, 1].
+    
+    This prevents the actor from seeing raw return magnitudes that can
+    cause gradient explosion (large returns) or vanishing (tiny returns),
+    which is a key contributor to bang-bang policy collapse.
+    """
+
+    def __init__(self, decay=0.99, low_percentile=5, high_percentile=95):
+        super().__init__()
+        self.decay = decay
+        self.low_pct = low_percentile / 100.0
+        self.high_pct = high_percentile / 100.0
+        self.register_buffer('low', torch.tensor(0.0))
+        self.register_buffer('high', torch.tensor(1.0))
+        self.register_buffer('initialized', torch.tensor(False))
+
+    @torch.no_grad()
+    def update(self, returns):
+        """Update running percentiles from a batch of returns."""
+        flat = returns.detach().float().flatten()
+        low = torch.quantile(flat, self.low_pct)
+        high = torch.quantile(flat, self.high_pct)
+
+        if not self.initialized:
+            self.low.copy_(low)
+            self.high.copy_(high)
+            self.initialized.fill_(True)
+        else:
+            self.low.copy_(self.decay * self.low + (1 - self.decay) * low)
+            self.high.copy_(self.decay * self.high + (1 - self.decay) * high)
+
+    def normalize(self, returns):
+        """
+        Normalize returns using tracked percentiles.
+        Gradients flow through `returns` — only the scale/offset are fixed (stop-gradient).
+        """
+        scale = (self.high - self.low).clamp(min=1e-2)
+        return (returns - self.low) / scale

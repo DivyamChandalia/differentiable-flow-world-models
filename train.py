@@ -10,7 +10,7 @@ from functools import partial
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from envs.helpers import make_env, SubprocVecEnv
-from losses import SIGReg, WeakSIGReg, ValueLoss, ActorLoss
+from losses import SIGReg, WeakSIGReg, ValueLoss, ActorLoss, ReturnEMA
 from models.agent import Actor, Value
 from models.dynamics import Dynamics
 from models.world_helpers import VisionEncoder, ActionEncoder, Reward, VisionDecoder, Termination
@@ -57,11 +57,13 @@ class Config:
     
     sigreg_weight: float = 0.1
     weak_sigreg: bool = True     # if True, use WeakSIGReg (Frobenius cov loss) instead of SIGReg
-    entropy_scale: float = 1e-4
+    entropy_scale: float = 3e-3
+    use_return_ema: bool = True
+    use_advantage: bool = False
     discount: float = 0.99
     actor_num_blocks: int = 4
     value_num_blocks: int = 4
-    use_symlog: bool = True
+    use_symlog: bool = False
 
     buffer_capacity: int = 150
     prefill_episodes: int = 50
@@ -154,6 +156,7 @@ class Trainer:
             self.sig_reg = SIGReg().to(self.device)
         self.value_loss_fn = ValueLoss(discount=cfg.discount, batch_first=False, use_symlog=cfg.use_symlog)
         self.actor_loss_fn = ActorLoss(discount=cfg.discount, batch_first=False, entropy_scale=cfg.entropy_scale)
+        self.return_ema = ReturnEMA(decay=0.99).to(self.device) if cfg.use_return_ema else None
         
         self.world_opt = optim.Adam(self.world.parameters(), lr=cfg.world_lr)
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
@@ -621,13 +624,8 @@ class Trainer:
 
             actor_input = torch.stack(history_list, dim=1).reshape(self.cfg.batch_size, -1)
 
-            # Get action chunk and its distribution
-            rollout_dist = self.actor.get_distribution(actor_input)
-            action_chunk = rollout_dist.rsample() # (batch_size, H, A)
-            
-            # Apply tanh and scale/bias to match actor.forward behaviour
-            y = torch.tanh(action_chunk)
-            action_chunk_scaled = y * self.actor.action_scale + self.actor.action_bias
+            # Generate squashed action chunk and its squashed log probability
+            action_chunk_scaled, squashed_log_prob, _ = self.actor(actor_input)
 
             ctx_actions_real = ctx_action_windows.to(device=self.device, dtype=action_chunk_scaled.dtype)
             actions_full = torch.cat([ctx_actions_real, action_chunk_scaled], dim=1) # (batch_size, ctx - 1 + H, A)
@@ -641,8 +639,10 @@ class Trainer:
             history_windows = self._get_history_windows(imagined_states, self.cfg.agent_horizon, context=ctx_windows)
 
             imagined_values = self.value_model(history_windows)
-            with torch.no_grad():
-                target_imagined_values = self.target_value_model(history_windows)
+            
+            # EMA values — differentiable w.r.t. inputs (gradient flows through
+            # imagined_states to actor), but target model params are frozen.
+            ema_imagined_values = self.target_value_model(history_windows)
                 
             pred_term_probs = torch.sigmoid(imagined_terminals)
             pcont = (1.0 - pred_term_probs).detach()
@@ -651,22 +651,33 @@ class Trainer:
                 imagined_values, 
                 imagined_rewards, 
                 pcont=pcont, 
-                target_values=target_imagined_values
+                target_values=ema_imagined_values.detach()  # fully detached for value bootstrap
             )
 
-            # Compute actor targets using the online value function (with gradients)
+            # Compute actor targets using the EMA value model (more stable estimates)
             targets_a = self.value_loss_fn._compute_lambda_returns(
-                imagined_values,
+                ema_imagined_values,
                 imagined_rewards,
                 pcont
             )
 
-            # Transpose distribution to match targets of shape (H, B, rollout_dist_trfrom torch.distributions import Normal1)
-            mean = rollout_dist.mean.transpose(0, 1) # (H, B, A)
-            std = rollout_dist.stddev.transpose(0, 1) # (H, B, A)
-            rollout_dist_transposed = Normal(mean, std)
+            # Optionally compute advantages (returns - value baseline) for contrastive signal
+            if self.cfg.use_advantage:
+                actor_targets = targets_a - imagined_values[:-1]
+            else:
+                actor_targets = targets_a
+            
+            # Optionally apply EMA percentile normalization
+            if self.return_ema is not None:
+                self.return_ema.update(actor_targets)
+                normalized_targets = self.return_ema.normalize(actor_targets)
+            else:
+                normalized_targets = actor_targets
 
-            a_loss, entropy = self.actor_loss_fn(targets_a, rollout_dist_transposed, pcont=pcont)
+            # Transpose squashed entropy (-log_prob) to match targets of shape (H, B, 1)
+            squashed_entropy = -squashed_log_prob.transpose(0, 1)
+
+            a_loss, a_target_loss, a_entropy_loss, entropy = self.actor_loss_fn(normalized_targets, squashed_entropy, pcont=pcont)
 
         self.value_opt.zero_grad(set_to_none=True)
         self.actor_opt.zero_grad(set_to_none=True)
@@ -680,7 +691,19 @@ class Trainer:
         for p in self.value_model.parameters():
             p.requires_grad = False
 
-        # Backward actor loss (updates actor weights, flows through value model inputs)
+        # Compute individual grad norms for actor loss components
+        scale_factor = self.scaler.get_scale()
+
+        self.actor_opt.zero_grad(set_to_none=True)
+        self.scaler.scale(a_target_loss).backward(retain_graph=True)
+        a_target_grad_norm = self._compute_grad_norm(self.actor) / scale_factor
+
+        self.actor_opt.zero_grad(set_to_none=True)
+        self.scaler.scale(a_entropy_loss).backward(retain_graph=True)
+        a_entropy_grad_norm = self._compute_grad_norm(self.actor) / scale_factor
+
+        # Combined backward for actual parameter update
+        self.actor_opt.zero_grad(set_to_none=True)
         self.scaler.scale(a_loss).backward()
 
         # Restore requires_grad on value model parameters
@@ -704,9 +727,17 @@ class Trainer:
 
         self.writer.add_scalar('Loss/Agent_Value', v_loss.item(), self.agent_step)
         self.writer.add_scalar('Loss/Agent_Actor', a_loss.item(), self.agent_step)
+        self.writer.add_scalar('Loss/Agent_Actor_Target', a_target_loss.item(), self.agent_step)
+        self.writer.add_scalar('Loss/Agent_Actor_Entropy', a_entropy_loss.item(), self.agent_step)
         self.writer.add_scalar('Loss/Agent_Entropy', entropy.item(), self.agent_step)
         self.writer.add_scalar('GradNorm/Agent_Value', v_grad_norm, self.agent_step)
         self.writer.add_scalar('GradNorm/Agent_Actor', a_grad_norm, self.agent_step)
+        self.writer.add_scalar('GradNorm/Agent_Actor_Target', a_target_grad_norm, self.agent_step)
+        self.writer.add_scalar('GradNorm/Agent_Actor_Entropy', a_entropy_grad_norm, self.agent_step)
+        if self.return_ema is not None:
+            self.writer.add_scalar('ReturnEMA/Low', self.return_ema.low.item(), self.agent_step)
+            self.writer.add_scalar('ReturnEMA/High', self.return_ema.high.item(), self.agent_step)
+            self.writer.add_scalar('ReturnEMA/Scale', (self.return_ema.high - self.return_ema.low).clamp(min=1e-2).item(), self.agent_step)
         self.agent_step += 1
 
         return v_loss.item(), a_loss.item()
