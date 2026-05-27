@@ -163,26 +163,31 @@ class ValueLoss(nn.Module):
         return targets
     
 class ActorLoss(nn.Module):
-    def __init__(self, entropy_scale=1e-4, discount=0.99, batch_first=False):
+    def __init__(self, entropy_scale=1e-4, discount=0.99, batch_first=False, reinforce=False):
         """
-        Actor Loss for analytical gradients (reparameterization trick).
+        Actor Loss supporting both analytical gradients (reparameterization trick)
+        and REINFORCE policy gradients.
         
         Args:
             entropy_scale (float): Weight of the entropy bonus.
             discount (float): Discount factor gamma used for per-step weighting.
             batch_first (bool): If True, expects [B, H, 1], else [H, B, 1].
+            reinforce (bool): If True, uses the REINFORCE gradient estimator.
         """
         super().__init__()
         self.entropy_scale = entropy_scale
         self.discount = discount
         self.batch_first = batch_first
+        self.reinforce = reinforce
 
-    def forward(self, targets, entropy, pcont=None):
+    def forward(self, targets, entropy, log_prob=None, pcont=None):
         """
         Args:
             targets (torch.Tensor): Lambda-returns from ValueLoss.
                                    Shape: [H, B, 1] or [B, H, 1]
             entropy (torch.Tensor): Pre-computed entropy of the policy distribution.
+                                   Shape: [H, B, 1] or [B, H, 1]
+            log_prob (torch.Tensor, optional): Log probabilities of the actions taken.
                                    Shape: [H, B, 1] or [B, H, 1]
             pcont (torch.Tensor, optional): Continuation probabilities.
                                    Shape: [H, B, 1] or [B, H, 1]
@@ -200,6 +205,8 @@ class ActorLoss(nn.Module):
         if self.batch_first:
             targets = targets.transpose(0, 1)
             entropy = entropy.transpose(0, 1)
+            if log_prob is not None:
+                log_prob = log_prob.transpose(0, 1)
             if pcont is not None:
                 pcont = pcont.transpose(0, 1)
 
@@ -217,7 +224,14 @@ class ActorLoss(nn.Module):
             discounts = torch.cat([ones, self.discount * pcont[:-1]], dim=0)
             discount_weights = torch.cumprod(discounts, dim=0)
 
-        target_loss = (-discount_weights * targets).mean()
+        if self.reinforce:
+            assert log_prob is not None, "log_prob must be provided if reinforce is True"
+            # REINFORCE loss: log_prob * detached_targets
+            target_loss = (-discount_weights * targets.detach() * log_prob).mean()
+        else:
+            # Pathwise/analytical gradients loss
+            target_loss = (-discount_weights * targets).mean()
+
         entropy_loss = (-discount_weights * self.entropy_scale * entropy).mean()
         combined_loss = target_loss + entropy_loss
 

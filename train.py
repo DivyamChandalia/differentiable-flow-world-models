@@ -60,6 +60,7 @@ class Config:
     entropy_scale: float = 3e-3
     use_return_ema: bool = True
     use_advantage: bool = False
+    reinforce: bool = True
     discount: float = 0.99
     actor_num_blocks: int = 4
     value_num_blocks: int = 4
@@ -155,7 +156,7 @@ class Trainer:
         else:
             self.sig_reg = SIGReg().to(self.device)
         self.value_loss_fn = ValueLoss(discount=cfg.discount, batch_first=False, use_symlog=cfg.use_symlog)
-        self.actor_loss_fn = ActorLoss(discount=cfg.discount, batch_first=False, entropy_scale=cfg.entropy_scale)
+        self.actor_loss_fn = ActorLoss(discount=cfg.discount, batch_first=False, entropy_scale=cfg.entropy_scale, reinforce=cfg.reinforce)
         self.return_ema = ReturnEMA(decay=0.99).to(self.device) if cfg.use_return_ema else None
         
         self.world_opt = optim.Adam(self.world.parameters(), lr=cfg.world_lr)
@@ -624,11 +625,17 @@ class Trainer:
 
             actor_input = torch.stack(history_list, dim=1).reshape(self.cfg.batch_size, -1)
 
-            # Generate squashed action chunk and its squashed log probability
-            action_chunk_scaled, squashed_log_prob, _ = self.actor(actor_input)
+            # Generate squashed action chunk, its squashed log probability, and analytical entropy
+            action_chunk_scaled, squashed_log_prob, analytical_entropy = self.actor(actor_input)
 
             ctx_actions_real = ctx_action_windows.to(device=self.device, dtype=action_chunk_scaled.dtype)
-            actions_full = torch.cat([ctx_actions_real, action_chunk_scaled], dim=1) # (batch_size, ctx - 1 + H, A)
+            
+            if self.cfg.reinforce:
+                action_chunk_scaled_for_wm = action_chunk_scaled.detach()
+            else:
+                action_chunk_scaled_for_wm = action_chunk_scaled
+
+            actions_full = torch.cat([ctx_actions_real, action_chunk_scaled_for_wm], dim=1) # (batch_size, ctx - 1 + H, A)
 
             # 1-step parallel generation pass
             imagined_states, imagined_rewards, imagined_terminals = self.world.generate_chunk(
@@ -662,22 +669,37 @@ class Trainer:
             )
 
             # Optionally compute advantages (returns - value baseline) for contrastive signal
-            if self.cfg.use_advantage:
+            if self.cfg.use_advantage or self.cfg.reinforce:
                 actor_targets = targets_a - imagined_values[:-1]
             else:
                 actor_targets = targets_a
             
             # Optionally apply EMA percentile normalization
             if self.return_ema is not None:
-                self.return_ema.update(actor_targets)
-                normalized_targets = self.return_ema.normalize(actor_targets)
+                if self.cfg.reinforce:
+                    # For REINFORCE, update with returns but normalize advantages by dividing by scale (preserving sign)
+                    self.return_ema.update(targets_a)
+                    scale = (self.return_ema.high - self.return_ema.low).clamp(min=1e-2)
+                    normalized_targets = actor_targets / scale
+                else:
+                    self.return_ema.update(actor_targets)
+                    normalized_targets = self.return_ema.normalize(actor_targets)
             else:
                 normalized_targets = actor_targets
 
-            # Transpose squashed entropy (-log_prob) to match targets of shape (H, B, 1)
-            squashed_entropy = -squashed_log_prob.transpose(0, 1)
+            # Determine whether to use analytical or squashed entropy
+            if self.cfg.reinforce:
+                entropy_to_use = analytical_entropy.transpose(0, 1)
+            else:
+                entropy_to_use = -squashed_log_prob.transpose(0, 1)
+            log_prob = squashed_log_prob.transpose(0, 1)
 
-            a_loss, a_target_loss, a_entropy_loss, entropy = self.actor_loss_fn(normalized_targets, squashed_entropy, pcont=pcont)
+            a_loss, a_target_loss, a_entropy_loss, entropy = self.actor_loss_fn(
+                normalized_targets, 
+                entropy_to_use, 
+                log_prob=log_prob, 
+                pcont=pcont
+            )
 
         self.value_opt.zero_grad(set_to_none=True)
         self.actor_opt.zero_grad(set_to_none=True)
