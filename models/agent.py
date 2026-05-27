@@ -26,6 +26,7 @@ class DeepResNetMLP(nn.Module):
         for block in self.blocks:
             x = x + block(x)
         return self.output_proj(x)
+        
 class Actor(nn.Module):
     def __init__(self, action_space, obs_dim, hidden_dim, chunk_size=15, num_blocks=2):
         super().__init__()
@@ -38,41 +39,72 @@ class Actor(nn.Module):
         self.register_buffer("action_scale", (high - low) / 2.0)
         self.register_buffer("action_bias", (high + low) / 2.0)
         
-        # FIX 1: Double the output dim to predict both mean and log_std dynamically
-        self.mlp = DeepResNetMLP(
-            input_dim=obs_dim,
-            hidden_dim=hidden_dim,
-            output_dim=2 * self.action_dim * self.chunk_size, 
-            num_blocks=num_blocks
+        # Project observation history context to hidden dimension
+        self.input_proj = nn.Linear(obs_dim, hidden_dim)
+        
+        # Learnable positional queries for the generated chunk sequence
+        self.pos_embeddings = nn.Parameter(torch.randn(chunk_size, hidden_dim))
+        
+        # Stack of Transformer blocks (Pre-LN style)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=4,
+            dim_feedforward=2 * hidden_dim,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_blocks)
+        
+        # Causal mask for the transformer encoder (context + chunk queries)
+        mask = nn.Transformer.generate_square_subsequent_mask(1 + chunk_size)
+        self.register_buffer("causal_mask", mask)
+        
+        # Shared projection head for output action parameters
+        self.action_head = nn.Linear(hidden_dim, 2 * self.action_dim)
         
         self._initialize_weights()
 
     def _initialize_weights(self):
-        for module in self.mlp.modules():
-            if isinstance(module, nn.Linear):
-                init_linear_orthogonal(module, gain=np.sqrt(2))
-                
-        final_layer = self._get_final_layer()
-        if final_layer is not None:
-            # Keep the final layer initialization small so the network starts near origin
-            init_linear_orthogonal(final_layer, gain=0.01)
-
-    def _get_final_layer(self):
-        modules = list(self.mlp.modules())
-        linear_layers = [m for m in modules if isinstance(m, nn.Linear)]
-        return linear_layers[-1] if linear_layers else None
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                init_linear_orthogonal(m, gain=np.sqrt(2))
+        
+        # Keep the final action head initialization small so the network starts near origin
+        init_linear_orthogonal(self.action_head, gain=0.01)
+        nn.init.normal_(self.pos_embeddings, std=0.02)
 
     def get_distribution(self, obs):
-        out = self.mlp(obs)
+        orig_shape = obs.shape[:-1]
+        obs_flat = obs.reshape(-1, obs.shape[-1])
+        B = obs_flat.shape[0]
+        
+        # Project observation to context embedding
+        obs_proj = self.input_proj(obs_flat).unsqueeze(1) # (B, 1, hidden_dim)
+        
+        # Construct target queries: (B, chunk_size, hidden_dim)
+        queries = self.pos_embeddings.unsqueeze(0).expand(B, -1, -1)
+        
+        # Concatenate context token with query sequence: (B, 1 + chunk_size, hidden_dim)
+        x = torch.cat([obs_proj, queries], dim=1)
+        
+        # Pass through Transformer Encoder with causal masking
+        out_seq = self.transformer(x, mask=self.causal_mask)
+        
+        # Extract the query output tokens: (B, chunk_size, hidden_dim)
+        queries_out = out_seq[:, 1:]
+        
+        # Map through the shared projection head: (B, chunk_size, 2 * action_dim)
+        action_params = self.action_head(queries_out)
+        
+        # Reshape back to the original batch dimensions
+        action_params = action_params.view(*orig_shape, self.chunk_size, 2 * self.action_dim)
         
         # Split the output into mean and log_std
-        raw_mean, log_std = torch.chunk(out, 2, dim=-1)
+        raw_mean, log_std = torch.chunk(action_params, 2, dim=-1)
         
-        raw_mean = raw_mean.view(*obs.shape[:-1], self.chunk_size, self.action_dim)
-        log_std = log_std.view(*obs.shape[:-1], self.chunk_size, self.action_dim)
-        
-        # FIX 2: -20 is too small for stable gradients. -5 or -10 is a safer floor.
+        # Clamp log_std for stability
         log_std = torch.clamp(log_std, min=-5.0, max=2.0)
         std = torch.exp(log_std)
         

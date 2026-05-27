@@ -55,15 +55,15 @@ class Config:
     amp_dtype: str = 'bfloat16' 
     value_target_tau: float = 0.02
     
-    sigreg_weight: float = 0.1
+    sigreg_weight: float = 0.05
     weak_sigreg: bool = True     # if True, use WeakSIGReg (Frobenius cov loss) instead of SIGReg
-    entropy_scale: float = 3e-3
-    use_return_ema: bool = True
+    entropy_scale: float = 3e-1
+    use_return_ema: bool = False
     use_advantage: bool = False
-    reinforce: bool = True
+    reinforce: bool = False
     discount: float = 0.99
     actor_num_blocks: int = 4
-    value_num_blocks: int = 4
+    value_num_blocks: int = 2
     use_symlog: bool = False
 
     buffer_capacity: int = 150

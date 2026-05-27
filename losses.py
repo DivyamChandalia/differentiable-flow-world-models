@@ -122,7 +122,7 @@ class ValueLoss(nn.Module):
 
         value_preds = values[:-1]
         
-        loss = F.smooth_l1_loss(value_preds, targets.detach(), reduction='mean', beta=1.0)
+        loss = F.mse_loss(value_preds, targets.detach(), reduction='mean')
 
         if self.batch_first:
             targets = targets.transpose(0, 1)
