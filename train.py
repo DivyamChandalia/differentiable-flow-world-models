@@ -33,10 +33,11 @@ class Config:
     
     latent_dim: int = 256
     hidden_dim: int = 256
-    dyn_num_layers: int = 4
+    dyn_num_layers: int = 6
     dyn_num_heads: int = 4
+    dyn_causal: bool = False
     
-    max_frames: int = 15
+    max_frames: int = 18
     world_horizon: int = 15
     agent_horizon: int = 3
     batch_size: int = 96  
@@ -55,26 +56,66 @@ class Config:
     amp_dtype: str = 'bfloat16' 
     value_target_tau: float = 0.02
     
-    sigreg_weight: float = 0.05
+    sigreg_weight: float = 0.1
     weak_sigreg: bool = True     # if True, use WeakSIGReg (Frobenius cov loss) instead of SIGReg
-    entropy_scale: float = 3e-1
-    use_return_ema: bool = False
+    entropy_scale: float = 3e-3
+    use_return_ema: bool = True
     use_advantage: bool = False
-    reinforce: bool = False
+    reinforce: bool = True
     discount: float = 0.99
     actor_num_blocks: int = 4
-    value_num_blocks: int = 2
-    use_symlog: bool = False
+    value_num_blocks: int = 4
+    use_symlog: bool = True
 
     buffer_capacity: int = 150
     prefill_episodes: int = 50
-    world_bootstrap_steps: int = 250  # extra WM-only gradient steps run after prefill, before training loop
+    world_bootstrap_steps: int = 1500  # extra WM-only gradient steps run after prefill, before training loop
     
     recon_debug: bool = True
     recon_train: bool = False
     
-    current_time = datetime.now().strftime("%Y%m%d-%H%M%S") 
-    log_dir: str = os.path.join('./runs/symlog_dreamer', current_time)
+    # Diagnostics
+    diag_enabled: bool = True          # master switch for actor diagnostics
+    diag_every_n_steps: int = 250      # run diagnostics every N agent steps
+    diag_landscape_grid: int = 21      # grid resolution for 2D landscape (11x11 = 121 evals)
+    diag_landscape_range: float = 1.0  # perturbation range in param space
+    diag_fd_check: bool = True         # finite-difference gradient check
+    diag_fd_params: int = 20           # number of params for FD check
+    
+    log_dir: str = ""
+
+    def __post_init__(self):
+        if not self.log_dir:
+            algo = "reinforce" if self.reinforce else "analytical"
+            current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+            
+            parts = [
+                f"{self.domain}_{self.task}",
+                algo,
+                f"ent{self.entropy_scale}",
+                f"alr{self.actor_lr}",
+                f"wlr{self.world_lr}",
+                f"vlr{self.value_lr}",
+                f"wh{self.world_horizon}",
+                f"ah{self.agent_horizon}",
+                f"sig{self.sigreg_weight}"
+            ]
+            
+            if self.weak_sigreg:
+                parts.append("weaksig")
+            else:
+                parts.append("sigreg")
+                
+            if self.use_return_ema:
+                parts.append("ema")
+            if self.use_advantage:
+                parts.append("adv")
+                
+            parts.append(f"seed{self.seed}")
+            parts.append(current_time)
+            
+            run_name = "_".join(parts)
+            self.log_dir = os.path.join('./runs', run_name)
 
 
 class EpisodeReplayBuffer:
@@ -119,6 +160,7 @@ class Trainer:
         self.cfg = cfg
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device} with {cfg.num_envs} parallel environments.")
+        print(f"TensorBoard log directory: {cfg.log_dir}")
         self.set_seed(cfg.seed)
         
         env_fns = [
@@ -133,7 +175,7 @@ class Trainer:
         vision = VisionEncoder(latent_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         action_enc = ActionEncoder(action_space=self.envs.get_action_space(), hidden_dim=cfg.hidden_dim, output_dim=cfg.latent_dim)
         dynamics = Dynamics(max_frames=cfg.max_frames + cfg.imagination_ctx_frames, action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim, 
-                            num_layers=cfg.dyn_num_layers, num_heads=cfg.dyn_num_heads)
+                            num_layers=cfg.dyn_num_layers, num_heads=cfg.dyn_num_heads, causal=cfg.dyn_causal)
         reward_enc = Reward(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         termination_enc = Termination(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         
@@ -172,6 +214,14 @@ class Trainer:
         self.global_step = 0
         self.agent_step = 0
         self.world_step = 0
+
+        # Diagnostics
+        if cfg.diag_enabled:
+            from diagnostics import LossLandscapeVisualizer, GradientFlowAnalyzer, ActionDistributionMonitor
+            self.landscape_viz = LossLandscapeVisualizer(self)
+            self.grad_analyzer = GradientFlowAnalyzer(self)
+            self.action_monitor = ActionDistributionMonitor(self)
+            self.diag_output_dir = os.path.join(cfg.log_dir, 'diagnostics')
 
     def set_seed(self, seed):
         random.seed(seed)
@@ -406,7 +456,9 @@ class Trainer:
         self.world.unfreeze()
         
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-            raw_states, target_state, pred_next_state, pred_rewards, pred_terminals = self.world(act_batch, obs_batch)
+            raw_states, target_state, pred_next_state, pred_rewards, pred_terminals = self.world(
+                act_batch, obs_batch, ctx_frames=self.cfg.imagination_ctx_frames
+            )
             
             recon_loss = None
             recon_pred_loss = None
@@ -501,12 +553,11 @@ class Trainer:
     def visualize_reconstruction(self, obs_batch, recon_obs, recon_pred_obs, raw_states, pred_next_state):
         
         idx = random.randint(0, obs_batch.size(0) - 1)
-        actual = obs_batch[idx].detach().cpu()
-        encoded = recon_obs[idx].detach().cpu()
-        pred = recon_pred_obs[idx].detach().cpu()
+        ctx = self.cfg.imagination_ctx_frames
         
-        zero_img = torch.zeros_like(encoded[:1])
-        pred_aligned = torch.cat([zero_img, pred], dim=0)
+        actual = obs_batch[idx, ctx:].detach().cpu()
+        encoded = recon_obs[idx, ctx:].detach().cpu()
+        pred_aligned = recon_pred_obs[idx, ctx-1:].detach().cpu()
 
         # Calculate predicted values for encoded and predicted states
         states_idx = raw_states[idx:idx+1].transpose(0, 1) # (T, 1, D)
@@ -515,7 +566,7 @@ class Trainer:
             enc_vals_raw = self.value_model(enc_windows)
             if self.cfg.use_symlog:
                 enc_vals_raw = symexp(enc_vals_raw)
-            enc_values = enc_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy() # shape (T,)
+            enc_values = enc_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()[ctx:] # shape (T-ctx,)
 
         pred_states_idx = torch.cat([raw_states[idx:idx+1, 0:1], pred_next_state[idx:idx+1]], dim=1).transpose(0, 1) # (T, 1, D)
         pred_windows = self._get_history_windows(pred_states_idx, self.cfg.agent_horizon, context=None) # (T, 1, agent_horizon * D)
@@ -523,7 +574,7 @@ class Trainer:
             pred_vals_raw = self.value_model(pred_windows)
             if self.cfg.use_symlog:
                 pred_vals_raw = symexp(pred_vals_raw)
-            pred_values = pred_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy() # shape (T,)
+            pred_values = pred_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()[ctx:] # shape (T-ctx,)
 
         # Draw values on encoded frames
         encoded_with_val = []
@@ -548,10 +599,22 @@ class Trainer:
             img_pil = to_pil_image(frame)
             draw = ImageDraw.Draw(img_pil)
             text = f"v:{val:.2f}"
+            mode_text = "GEN"
+            mode_color = "red"
+                
             x, y = 2, 2
+            if text:
+                for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
+                    draw.text((x + dx, y + dy), text, fill="black")
+                draw.text((x, y), text, fill="white")
+                
+            # Draw mode text at bottom
+            w, h = img_pil.size
+            x_m, y_m = 2, h - 12
             for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
-                draw.text((x + dx, y + dy), text, fill="black")
-            draw.text((x, y), text, fill="white")
+                draw.text((x_m + dx, y_m + dy), mode_text, fill="black")
+            draw.text((x_m, y_m), mode_text, fill=mode_color)
+            
             pred_aligned_with_val.append(to_tensor(img_pil))
         pred_aligned_with_val = torch.stack(pred_aligned_with_val, dim=0)
         
@@ -760,9 +823,85 @@ class Trainer:
             self.writer.add_scalar('ReturnEMA/Low', self.return_ema.low.item(), self.agent_step)
             self.writer.add_scalar('ReturnEMA/High', self.return_ema.high.item(), self.agent_step)
             self.writer.add_scalar('ReturnEMA/Scale', (self.return_ema.high - self.return_ema.low).clamp(min=1e-2).item(), self.agent_step)
+        # Run diagnostics periodically
+        if self.cfg.diag_enabled and self.agent_step % self.cfg.diag_every_n_steps == 0 and self.agent_step > 0:
+            self._run_inline_diagnostics(start_states, real_actions)
+
         self.agent_step += 1
 
         return v_loss.item(), a_loss.item()
+
+    def _run_inline_diagnostics(self, start_states, real_actions):
+        """Run actor diagnostics and log results to TensorBoard + save plots."""
+        step = self.agent_step
+        save_dir = os.path.join(self.diag_output_dir, f'step_{step:06d}')
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"\n[Diagnostics] Running at agent_step={step}...")
+
+        was_training_actor = self.actor.training
+        was_training_value = self.value_model.training
+        self.actor.eval()
+        self.value_model.eval()
+
+        try:
+            # 1. Action distribution stats (fast)
+            action_stats = self.action_monitor.collect_action_stats(start_states, real_actions)
+            self.action_monitor.plot_action_stats(action_stats, save_dir=save_dir)
+
+            self.writer.add_scalar('Diag/PreTanh_MeanAbs_Max', float(action_stats['pre_tanh_mean_abs'].max()), step)
+            self.writer.add_scalar('Diag/PostTanh_MeanAbs_Max', float(action_stats['post_tanh_mean_abs'].max()), step)
+            self.writer.add_scalar('Diag/ActionStd_Min', float(action_stats['pre_tanh_std'].min()), step)
+            self.writer.add_scalar('Diag/AnalyticalEntropy_Mean', float(action_stats['analytical_entropy'].mean()), step)
+
+            # 2. Loss landscape (moderate cost)
+            landscape_data = self.landscape_viz.compute_landscape(
+                start_states, real_actions,
+                grid_size=self.cfg.diag_landscape_grid,
+                range_scale=self.cfg.diag_landscape_range
+            )
+            self.landscape_viz.plot_landscape(landscape_data, save_dir=save_dir)
+
+            total = landscape_data['total_loss']
+            center = total[self.cfg.diag_landscape_grid // 2, self.cfg.diag_landscape_grid // 2]
+            self.writer.add_scalar('Diag/Landscape_CenterLoss', center, step)
+            self.writer.add_scalar('Diag/Landscape_Std', float(total.std()), step)
+            self.writer.add_scalar('Diag/Landscape_Range', float(total.max() - total.min()), step)
+
+            # 3. Gradient slice (moderate cost)
+            slice_data = self.landscape_viz.compute_gradient_slice(
+                start_states, real_actions, num_points=21,
+                range_scale=self.cfg.diag_landscape_range
+            )
+            self.landscape_viz.plot_gradient_slice(slice_data, save_dir=save_dir)
+            if slice_data:
+                self.writer.add_scalar('Diag/GradNorm_Actor', slice_data['grad_norm'], step)
+
+            # 4. Per-layer gradient norms
+            self.landscape_viz._run_actor_forward_with_grad(start_states, real_actions)
+            norms = self.grad_analyzer.per_layer_grad_norms()
+            self.grad_analyzer.plot_grad_norms(norms, save_dir=save_dir)
+
+            vanishing = sum(1 for v in norms.values() if v < 1e-7)
+            self.writer.add_scalar('Diag/VanishingLayers', vanishing, step)
+
+            # 5. Finite-difference check (expensive, optional)
+            if self.cfg.diag_fd_check:
+                fd_data = self.grad_analyzer.finite_difference_check(
+                    start_states, real_actions, num_params=self.cfg.diag_fd_params
+                )
+                self.grad_analyzer.plot_fd_comparison(fd_data, save_dir=save_dir)
+                self.writer.add_scalar('Diag/FD_CosineSim', fd_data['cosine_similarity'], step)
+                self.writer.add_scalar('Diag/FD_RelError', fd_data['mean_relative_error'], step)
+
+            print(f"[Diagnostics] Done. Plots saved to {save_dir}")
+
+        except Exception as e:
+            print(f"[Diagnostics] Error: {e}")
+        finally:
+            if was_training_actor:
+                self.actor.train()
+            if was_training_value:
+                self.value_model.train()
     
     def run(self):
         try:

@@ -81,10 +81,11 @@ class SwiGLUMLP(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, num_heads, causal=True):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.causal = causal
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
@@ -108,7 +109,7 @@ class SelfAttention(nn.Module):
             
         new_kv_cache = (k, v)
         
-        is_causal = T > 1 
+        is_causal = (T > 1) if self.causal else False
         
         x = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         
@@ -118,12 +119,12 @@ class SelfAttention(nn.Module):
         return x, new_kv_cache
 
 class AdaLNTransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, cond_dim, mlp_ratio=4.0):
+    def __init__(self, dim, num_heads, cond_dim, mlp_ratio=4.0, causal=True):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
         
-        self.attn = SelfAttention(dim, num_heads)
+        self.attn = SelfAttention(dim, num_heads, causal=causal)
         
         mlp_hidden_dim = int(dim * mlp_ratio * (2/3))
         self.mlp = SwiGLUMLP(dim, mlp_hidden_dim) 
@@ -158,7 +159,7 @@ class AdaLNTransformerBlock(nn.Module):
         return x, new_kv_cache
 
 class ConditionalTransformer(nn.Module):
-    def __init__(self, depth, dim, num_heads, cond_dim, seq_len, window_size=None):
+    def __init__(self, depth, dim, num_heads, cond_dim, seq_len, window_size=None, causal=True):
         super().__init__()
         self.window_size = window_size
         self.head_dim = dim // num_heads
@@ -167,7 +168,7 @@ class ConditionalTransformer(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         
         self.blocks = nn.ModuleList([
-            AdaLNTransformerBlock(dim, num_heads, cond_dim) 
+            AdaLNTransformerBlock(dim, num_heads, cond_dim, causal=causal) 
             for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(dim)

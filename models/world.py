@@ -12,12 +12,8 @@ class World(nn.Module):
         self.decoder = decoder
         self.latest_state = None
         self.horizon = horizon
-        
-        # Learnable sequence of placeholders acting as positional state embeddings
-        state_dim = reward.mlp.up_proj.in_features
-        self.state_placeholder = nn.Parameter(torch.randn(1, self.horizon, state_dim) * 0.02)
 
-    def forward(self, actions, observations):
+    def forward(self, actions, observations, ctx_frames=None):
         '''
         action: (B, T-1, Action space)
         observations: (B, T, C, H, W)
@@ -33,7 +29,15 @@ class World(nn.Module):
         current_states = states[:, :-1] 
         target_state = states[:, 1:]   
 
-        next_state = self.dynamics(current_states, action_embedding)
+        if ctx_frames is not None and ctx_frames < T_act:
+            real_ctx = current_states[:, :ctx_frames]
+            mean_context = real_ctx.mean(dim=1, keepdim=True)
+            placeholders = mean_context.expand(-1, T_act - ctx_frames, -1)
+            x_input = torch.cat([real_ctx, placeholders], dim=1)
+        else:
+            x_input = current_states
+
+        next_state = self.dynamics(x_input, action_embedding)
         
         rewards = self.reward(next_state)
         terminals = self.termination(next_state)
@@ -73,9 +77,9 @@ class World(nn.Module):
             curr_action = action_embedding[:, -1:]
 
             # Stop gradients of states and KV cache flowing back in time
-            self.latest_state = self.latest_state.detach()
+            # self.latest_state = self.latest_state.detach()
             if self.current_kv_cache is not None:
-                self.current_kv_cache = [(k.detach(), v.detach()) for k, v in self.current_kv_cache]
+                # self.current_kv_cache = [(k.detach(), v.detach()) for k, v in self.current_kv_cache]
 
                 # Sliding window: evict the oldest token if we are at the horizon limit.
                 # This keeps start_pos + 1 <= self.horizon so RoPE freqs_cis never goes
@@ -110,8 +114,9 @@ class World(nn.Module):
         ctx = start_states.size(1)
         chunk_size = T_act - ctx + 1
         
-        # Sliced and expanded learnable positional placeholders
-        repeated_placeholder = self.state_placeholder[:, :chunk_size - 1].expand(B, -1, -1)
+        # Sliced and expanded mean context embeddings
+        mean_context = start_states.mean(dim=1, keepdim=True)
+        repeated_placeholder = mean_context.expand(-1, chunk_size - 1, -1)
         x_input = torch.cat([start_states, repeated_placeholder], dim=1) # (B, ctx - 1 + chunk_size, D)
         
         # 1-step parallel generation pass

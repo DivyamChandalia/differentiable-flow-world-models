@@ -9,6 +9,7 @@ class Dynamics(nn.Module):
                  num_layers,
                  num_heads,
                  dropout=0.0,
+                 causal=True,
                  ):
         super().__init__()
         self.transformer = ConditionalTransformer(
@@ -16,7 +17,8 @@ class Dynamics(nn.Module):
             dim=hidden_dim, 
             num_heads=num_heads, 
             cond_dim=action_dim,
-            seq_len=max_frames
+            seq_len=max_frames,
+            causal=causal
         )
         self.horizon = max_frames
 
