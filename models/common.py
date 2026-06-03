@@ -8,6 +8,51 @@ def symlog(x):
 def symexp(x):
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
 
+import math
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Embeds a scalar timestep t ∈ [0, 1] into a dense vector.
+    
+    Uses sinusoidal positional encoding (à la Transformer / DDPM)
+    followed by a two-layer MLP projection.
+    """
+
+    def __init__(self, hidden_dim, max_period=10000):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.max_period = max_period
+        # Two-layer MLP: sin/cos features → hidden_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, t):
+        """
+        Args:
+            t: (B,) or (B, 1) — scalar timesteps in [0, 1].
+        Returns:
+            (B, hidden_dim) time embeddings.
+        """
+        if t.dim() == 2:
+            t = t.squeeze(-1)  # (B,)
+
+        half = self.hidden_dim // 2
+        freqs = torch.exp(
+            -math.log(self.max_period)
+            * torch.arange(half, device=t.device, dtype=t.dtype)
+            / half
+        )
+        args = t[:, None] * freqs[None, :]  # (B, half)
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (B, hidden_dim)
+
+        # Handle odd hidden_dim
+        if self.hidden_dim % 2 == 1:
+            embedding = F.pad(embedding, (0, 1))
+
+        return self.mlp(embedding)
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     """
     Precompute the frequency tensor for complex exponentials (RoPE).

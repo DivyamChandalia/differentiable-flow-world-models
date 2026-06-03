@@ -12,7 +12,7 @@ from tqdm import tqdm
 from envs.helpers import make_env, SubprocVecEnv
 from losses import SIGReg, WeakSIGReg, ValueLoss, ActorLoss, ReturnEMA
 from models.agent import Actor, Value
-from models.dynamics import Dynamics
+from models.dynamics import FlowMatchingDynamics
 from models.world_helpers import VisionEncoder, ActionEncoder, Reward, VisionDecoder, Termination
 import torchvision
 from models.world import World
@@ -36,6 +36,7 @@ class Config:
     dyn_num_layers: int = 6
     dyn_num_heads: int = 4
     dyn_causal: bool = False
+    flow_num_euler_steps: int = 6
     
     max_frames: int = 18
     world_horizon: int = 15
@@ -174,8 +175,12 @@ class Trainer:
         
         vision = VisionEncoder(latent_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         action_enc = ActionEncoder(action_space=self.envs.get_action_space(), hidden_dim=cfg.hidden_dim, output_dim=cfg.latent_dim)
-        dynamics = Dynamics(max_frames=cfg.max_frames + cfg.imagination_ctx_frames, action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim, 
-                            num_layers=cfg.dyn_num_layers, num_heads=cfg.dyn_num_heads, causal=cfg.dyn_causal)
+        dynamics = FlowMatchingDynamics(
+            max_frames=cfg.max_frames + cfg.imagination_ctx_frames,
+            action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim,
+            num_layers=cfg.dyn_num_layers, num_heads=cfg.dyn_num_heads,
+            causal=cfg.dyn_causal, num_euler_steps=cfg.flow_num_euler_steps
+        )
         reward_enc = Reward(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         termination_enc = Termination(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         
@@ -456,7 +461,7 @@ class Trainer:
         self.world.unfreeze()
         
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-            raw_states, target_state, pred_next_state, pred_rewards, pred_terminals = self.world(
+            raw_states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss = self.world(
                 act_batch, obs_batch, ctx_frames=self.cfg.imagination_ctx_frames
             )
             
@@ -474,7 +479,8 @@ class Trainer:
                 recon_pred_loss = F.mse_loss(recon_pred_obs.float(), obs_batch[:, 1:].float())
                 total_recon_loss = recon_loss + recon_pred_loss
             
-        dyn_loss = F.mse_loss(pred_next_state.float(), target_state.detach().float())
+        # Flow matching velocity loss replaces the old MSE dynamics loss
+        dyn_loss = velocity_loss
         rew_loss = F.mse_loss(pred_rewards.float(), sym_rew_batch[:, 1:].float())
         term_loss = F.binary_cross_entropy_with_logits(pred_terminals.float(), term_batch[:, 1:].float())
         sig_loss = self.sig_reg(raw_states.transpose(0, 1).float())

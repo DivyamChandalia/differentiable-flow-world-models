@@ -15,8 +15,19 @@ class World(nn.Module):
 
     def forward(self, actions, observations, ctx_frames=None):
         '''
+        Training forward pass with flow matching dynamics.
+
         action: (B, T-1, Action space)
         observations: (B, T, C, H, W)
+        ctx_frames: int — number of real frames used as context
+
+        Returns:
+            states:        (B, T, D)     all encoded states
+            target_state:  (B, T-1, D)   ground-truth next states
+            pred_states:   (B, T-1, D)   predicted next states (from Euler solve)
+            rewards:       (B, T-1, 1)   predicted rewards
+            terminals:     (B, T-1, 1)   predicted terminals
+            velocity_loss: scalar        CFM velocity matching loss
         '''
 
         B, T_act, AS = actions.shape
@@ -26,78 +37,82 @@ class World(nn.Module):
         states = self.vision(observations.reshape(B*T_obs, C, H, W))
 
         states = states.reshape(B, T_obs, -1)
-        current_states = states[:, :-1] 
-        target_state = states[:, 1:]   
+        current_states = states[:, :-1]   # (B, T-1, D) = (B, T_act, D)
+        target_state = states[:, 1:]      # (B, T-1, D) = (B, T_act, D)
 
+        # --- Flow matching dynamics ---
+        # With ctx_frames context states, we predict T_act - ctx_frames + 1 future states.
+        # Context: states[0..ctx-1]  (ctx_frames states)
+        # Targets: states[ctx..T-1]  (T_act - ctx_frames + 1 states = target_state[ctx-1:])
+        # Future actions: actions[ctx-1..T-2]  (one action per future target)
         if ctx_frames is not None and ctx_frames < T_act:
-            real_ctx = current_states[:, :ctx_frames]
-            mean_context = real_ctx.mean(dim=1, keepdim=True)
-            placeholders = mean_context.expand(-1, T_act - ctx_frames, -1)
-            x_input = torch.cat([real_ctx, placeholders], dim=1)
+            ctx_states = current_states[:, :ctx_frames]            # (B, ctx, D)
+            future_targets = target_state[:, ctx_frames - 1:]      # (B, T_act - ctx + 1, D)
+            future_action_emb = action_embedding[:, ctx_frames - 1:]  # (B, T_act - ctx + 1, act_dim)
         else:
-            x_input = current_states
+            ctx_frames = 1
+            ctx_states = current_states[:, :1]
+            future_targets = target_state
+            future_action_emb = action_embedding
 
-        next_state = self.dynamics(x_input, action_embedding)
+        # Flow matching: velocity loss + predicted states via Euler solve
+        velocity_loss, pred_next_state = self.dynamics(
+            ctx_states, future_action_emb, future_targets
+        )
         
-        rewards = self.reward(next_state)
-        terminals = self.termination(next_state)
+        # Pad predicted states to match full T_act length for reward/term heads
+        # pred_next_state is (B, H, D) where H = future_targets.size(1)
+        if ctx_frames > 1:
+            # Prepend context states (excluding first, which is the start frame)
+            full_pred = torch.cat([current_states[:, 1:ctx_frames], pred_next_state], dim=1)
+        else:
+            full_pred = pred_next_state
+        
+        # Ensure we have exactly T_act predictions for reward/term heads
+        full_pred = full_pred[:, :T_act]
+        
+        rewards = self.reward(full_pred)
+        terminals = self.termination(full_pred)
 
-        return states, target_state, next_state, rewards, terminals
+        return states, target_state, full_pred, rewards, terminals, velocity_loss
     
     def reset_cache(self):
-        """Clears the KV cache before a new sequence rollout."""
-        self.current_kv_cache = None
+        """Kept for API compatibility. Flow matching is non-autoregressive."""
         self.latest_state = None
 
     def step_world(self, actions, start_observations=None, start_states=None):
         '''
+        Single-step world prediction for environment rollouts.
+        Uses flow matching generate() with a 1-step prediction horizon.
+
         actions: (B, Seq, Action space)
-        start_observations: (B, 3, C, H, W) - For environment rollouts
+        start_observations: (B, T, C, H, W) - For environment rollouts
         start_states: (B, Seq, Latent) - For imagination rollouts
         '''
         action_embedding = self.action(actions)
 
-        if self.current_kv_cache is None:
+        if self.latest_state is not None:
+            # Use latest_state as context (B, 1, D), predict one step forward
+            ctx = self.latest_state  # (B, 1, D)
+            future_act = action_embedding[:, -1:]  # (B, 1, act_dim)
+
+            pred = self.dynamics.generate(
+                ctx_states=ctx,
+                future_action_emb=future_act,
+                num_steps=self.dynamics.num_euler_steps,
+            )  # (B, 1, D)
+            self.latest_state = pred
+        else:
+            # First call: encode observations/states and store context
             if start_observations is not None:
                 B, T, C, H, W = start_observations.shape
                 state = self.vision(start_observations.reshape(B*T, C, H, W)).reshape(B, T, -1)
             elif start_states is not None:
                 state = start_states
             else:
-                raise ValueError("start_observations or start_states required for initial rollout")
+                raise ValueError("start_observations or start_states required for initial step")
+            self.latest_state = state[:, -1:]
             
-            if state.size(1) > self.horizon:
-                state = state[:, -self.horizon:]
-                action_embedding = action_embedding[:, -self.horizon:]
-
-            out_states, self.current_kv_cache = self.dynamics(state, action_embedding, kv_cache=[])
-            self.latest_state = out_states[:, -1:]
-
-        else:
-            curr_action = action_embedding[:, -1:]
-
-            # Stop gradients of states and KV cache flowing back in time
-            # self.latest_state = self.latest_state.detach()
-            if self.current_kv_cache is not None:
-                # self.current_kv_cache = [(k.detach(), v.detach()) for k, v in self.current_kv_cache]
-
-                # Sliding window: evict the oldest token if we are at the horizon limit.
-                # This keeps start_pos + 1 <= self.horizon so RoPE freqs_cis never goes
-                # out of bounds regardless of how many context frames primed the cache.
-                cache_len = self.current_kv_cache[0][0].size(2)  # tokens already in cache
-                if cache_len >= self.horizon:
-                    self.current_kv_cache = [
-                        (k[:, :, 1:, :], v[:, :, 1:, :])
-                        for k, v in self.current_kv_cache
-                    ]
-
-            out_states, self.current_kv_cache = self.dynamics(
-                self.latest_state,
-                curr_action,
-                kv_cache=self.current_kv_cache
-            )
-            self.latest_state = out_states[:, -1:]
-
         reward = self.reward(self.latest_state.squeeze(1))
         terminal = self.termination(self.latest_state.squeeze(1))
 
@@ -105,8 +120,16 @@ class World(nn.Module):
 
     def generate_chunk(self, actions, start_states):
         '''
+        Parallel chunk generation via flow matching Euler integration.
+        Fully differentiable — gradients flow through all Euler steps.
+
         actions: (B, T_act, Action space) - where T_act = ctx - 1 + chunk_size
         start_states: (B, ctx, Latent)
+        
+        Returns:
+            all_states_seq: (chunk_size + 1, B, D)  — includes start state
+            rewards:        (chunk_size, B, 1)
+            terminals:      (chunk_size, B, 1)
         '''
         B, T_act, AS = actions.shape
         action_embedding = self.action(actions.reshape(B * T_act, AS)).reshape(B, T_act, -1)
@@ -114,26 +137,26 @@ class World(nn.Module):
         ctx = start_states.size(1)
         chunk_size = T_act - ctx + 1
         
-        # Sliced and expanded mean context embeddings
-        mean_context = start_states.mean(dim=1, keepdim=True)
-        repeated_placeholder = mean_context.expand(-1, chunk_size - 1, -1)
-        x_input = torch.cat([start_states, repeated_placeholder], dim=1) # (B, ctx - 1 + chunk_size, D)
+        # actions layout: [ctx-1 context transition actions | chunk_size future actions]
+        # The dynamics model only needs the future action embeddings
+        future_action_emb = action_embedding[:, ctx - 1:]  # (B, chunk_size, act_dim)
         
-        # 1-step parallel generation pass
-        out_states = self.dynamics(x_input, action_embedding, kv_cache=None) # (B, ctx - 1 + chunk_size, D)
-        
-        # Extract imagined states (predictions for steps ctx ... ctx - 1 + chunk_size)
-        imagined_states = out_states[:, ctx - 1:] # (B, chunk_size, D)
+        # Flow matching: generate chunk_size future states from context
+        imagined_states = self.dynamics.generate(
+            ctx_states=start_states,
+            future_action_emb=future_action_emb,
+            num_steps=self.dynamics.num_euler_steps,
+        )  # (B, chunk_size, D)
         
         # Prepend the starting state to get chunk_size + 1 states
-        all_states = torch.cat([start_states[:, -1:], imagined_states], dim=1) # (B, chunk_size + 1, D)
+        all_states = torch.cat([start_states[:, -1:], imagined_states], dim=1)  # (B, chunk_size + 1, D)
         
         # Transpose to (Seq, B, D) format
-        all_states_seq = all_states.transpose(0, 1) # (chunk_size + 1, B, D)
-        imagined_states_seq = imagined_states.transpose(0, 1) # (chunk_size, B, D)
+        all_states_seq = all_states.transpose(0, 1)       # (chunk_size + 1, B, D)
+        imagined_states_seq = imagined_states.transpose(0, 1)  # (chunk_size, B, D)
         
         # Predict rewards and terminals
-        rewards = self.reward(imagined_states_seq) # (chunk_size, B, 1)
+        rewards = self.reward(imagined_states_seq)       # (chunk_size, B, 1)
         terminals = self.termination(imagined_states_seq) # (chunk_size, B, 1)
         
         return all_states_seq, rewards, terminals
@@ -155,7 +178,7 @@ if __name__ == "__main__":
     import torch.nn.functional as F
     import torch.optim as optim
     from .world_helpers import VisionEncoder, ActionEncoder, Reward, Termination
-    from .dynamics import Dynamics
+    from .dynamics import FlowMatchingDynamics
     from .agent import Actor, Value
     from gymnasium import spaces
     import numpy as np
@@ -170,12 +193,13 @@ if __name__ == "__main__":
     
     vision = VisionEncoder(latent_dim=latent_dim, hidden_dim=hidden_dim)
     action_encoder = ActionEncoder(action_space=action_space, hidden_dim=hidden_dim, output_dim=latent_dim)
-    dynamics = Dynamics(
+    dynamics = FlowMatchingDynamics(
         max_frames=horizon,
         action_dim=latent_dim,
         hidden_dim=latent_dim,
         num_layers=6,
-        num_heads=4
+        num_heads=4,
+        num_euler_steps=6,
     )
     reward = Reward(obs_dim=latent_dim, hidden_dim=hidden_dim)
     termination = Termination(obs_dim=latent_dim, hidden_dim=hidden_dim)
@@ -210,52 +234,36 @@ if __name__ == "__main__":
 
         world_optimizer.zero_grad()
         
-        states, target_latents, pred_latents, pred_rewards, pred_terminals = world(batch_actions, batch_obs)
+        states, target_latents, pred_latents, pred_rewards, pred_terminals, vel_loss = world(
+            batch_actions, batch_obs, ctx_frames=3
+        )
         
-        latent_loss = F.mse_loss(pred_latents, target_latents)
         reward_loss = F.mse_loss(pred_rewards, batch_rewards_gt)
         term_loss = F.binary_cross_entropy_with_logits(pred_terminals, batch_terminals_gt)
         
-        world_loss = latent_loss + reward_loss + term_loss
+        world_loss = vel_loss + reward_loss + term_loss
         
         world_loss.backward()
         world_optimizer.step()
         
         if step % 2 == 0:
             print(f"Step {step} | Total Loss: {world_loss.item():.4f} "
-                  f"(Latent: {latent_loss.item():.4f}, Reward: {reward_loss.item():.4f}, Term: {term_loss.item():.4f})")
+                  f"(Velocity: {vel_loss.item():.4f}, Reward: {reward_loss.item():.4f}, Term: {term_loss.item():.4f})")
 
 
-    print("\n--- Imagination Rollout (Actor/Value Training Phase) ---")
+    print("\n--- Imagination Rollout (Flow Matching Chunk Generation) ---")
     imagination_horizon = 15
+    ctx_frames = 3
     
-    world.reset()
     world.freeze()
     
-    start_obs = torch.randn(batch_size, 1, 3, img_size[0], img_size[1])
-    dummy_start_act = torch.zeros(batch_size, 1, action_space.shape[0])
+    start_obs = torch.randn(batch_size, ctx_frames, 3, img_size[0], img_size[1])
+    with torch.no_grad():
+        ctx_states = vision(start_obs.reshape(-1, 3, img_size[0], img_size[1])).reshape(batch_size, ctx_frames, -1)
     
-    _ = world.step_world(dummy_start_act, start_observations=start_obs)
+    dummy_actions = torch.randn(batch_size, ctx_frames - 1 + imagination_horizon, action_space.shape[0])
     
-    imagined_rewards = []
-    imagined_terminals = []
-    imagined_values = []
-    log_probs = []
+    all_states, rewards, terminals = world.generate_chunk(dummy_actions, ctx_states)
     
-    for t in range(imagination_horizon):
-        current_latent = world.latest_state.squeeze(1).detach()
-        
-        action, log_prob, _ = actor(current_latent)
-        
-        action_seq = action[:, -1].unsqueeze(1)
-        _, predicted_reward, predicted_terminal = world.step_world(action_seq)
-        
-        state_value = value(world.latest_state.squeeze(1))
-        
-        imagined_rewards.append(predicted_reward)
-        imagined_terminals.append(predicted_terminal)
-        imagined_values.append(state_value)
-        log_probs.append(log_prob)
-        
-    print(f"Successfully imagined a trajectory of {imagination_horizon} steps.")
-    print(f"Collected Shapes -> Rewards: {imagined_rewards[0].shape}, Terminals: {imagined_terminals[0].shape}, Values: {imagined_values[0].shape}")
+    print(f"Successfully generated a trajectory of {imagination_horizon} steps via flow matching.")
+    print(f"States: {all_states.shape}, Rewards: {rewards.shape}, Terminals: {terminals.shape}")
