@@ -23,10 +23,10 @@ class World(nn.Module):
 
         Returns:
             states:        (B, T, D)     all encoded states
-            target_state:  (B, T-1, D)   ground-truth next states
-            pred_states:   (B, T-1, D)   predicted next states (from Euler solve)
-            rewards:       (B, T-1, 1)   predicted rewards
-            terminals:     (B, T-1, 1)   predicted terminals
+            target_state:  (B, T-1, D)   ground-truth next states (encoder outputs)
+            euler_pred:    (B, T-1, D)   Euler-predicted states (for recon visualization only)
+            rewards:       (B, T-1, 1)   predicted rewards (from target states)
+            terminals:     (B, T-1, 1)   predicted terminals (from target states)
             velocity_loss: scalar        CFM velocity matching loss
         '''
 
@@ -41,40 +41,40 @@ class World(nn.Module):
         target_state = states[:, 1:]      # (B, T-1, D) = (B, T_act, D)
 
         # --- Flow matching dynamics ---
-        # With ctx_frames context states, we predict T_act - ctx_frames + 1 future states.
-        # Context: states[0..ctx-1]  (ctx_frames states)
-        # Targets: states[ctx..T-1]  (T_act - ctx_frames + 1 states = target_state[ctx-1:])
-        # Future actions: actions[ctx-1..T-2]  (one action per future target)
         if ctx_frames is not None and ctx_frames < T_act:
             ctx_states = current_states[:, :ctx_frames]            # (B, ctx, D)
-            future_targets = target_state[:, ctx_frames - 1:]      # (B, T_act - ctx + 1, D)
-            future_action_emb = action_embedding[:, ctx_frames - 1:]  # (B, T_act - ctx + 1, act_dim)
+            future_targets = target_state[:, ctx_frames - 1:]      # (B, H, D)
+            future_action_emb = action_embedding[:, ctx_frames - 1:]  # (B, H, act_dim)
         else:
             ctx_frames = 1
             ctx_states = current_states[:, :1]
             future_targets = target_state
             future_action_emb = action_embedding
 
-        # Flow matching: velocity loss + predicted states via Euler solve
-        velocity_loss, pred_next_state = self.dynamics(
+        # Velocity matching loss (trains the velocity network)
+        velocity_loss = self.dynamics(
             ctx_states, future_action_emb, future_targets
         )
-        
-        # Pad predicted states to match full T_act length for reward/term heads
-        # pred_next_state is (B, H, D) where H = future_targets.size(1)
-        if ctx_frames > 1:
-            # Prepend context states (excluding first, which is the start frame)
-            full_pred = torch.cat([current_states[:, 1:ctx_frames], pred_next_state], dim=1)
-        else:
-            full_pred = pred_next_state
-        
-        # Ensure we have exactly T_act predictions for reward/term heads
-        full_pred = full_pred[:, :T_act]
-        
-        rewards = self.reward(full_pred)
-        terminals = self.termination(full_pred)
 
-        return states, target_state, full_pred, rewards, terminals, velocity_loss
+        # Reward/term heads train on TARGET states (encoder outputs) — always
+        # meaningful representations, unlike Euler-predicted states which are
+        # garbage early in training.
+        rewards = self.reward(target_state)
+        terminals = self.termination(target_state)
+
+        # Euler solve for reconstruction visualization only (no grad needed)
+        with torch.no_grad():
+            euler_pred = self.dynamics.generate(
+                ctx_states, future_action_emb
+            )  # (B, H, D)
+            # Pad to full T_act length for visualization
+            if ctx_frames > 1:
+                euler_full = torch.cat([current_states[:, 1:ctx_frames], euler_pred], dim=1)
+            else:
+                euler_full = euler_pred
+            euler_full = euler_full[:, :T_act]
+
+        return states, target_state, euler_full, rewards, terminals, velocity_loss
     
     def reset_cache(self):
         """Kept for API compatibility. Flow matching is non-autoregressive."""
