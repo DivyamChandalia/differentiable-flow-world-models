@@ -38,6 +38,9 @@ class SinusoidalTimeEmbedding(nn.Module):
         if t.dim() == 2:
             t = t.squeeze(-1)  # (B,)
 
+        # Scale continuous t in [0, 1] to [0, 1000] to match the sinusoidal frequency period
+        t = t * 1000.0
+
         half = self.hidden_dim // 2
         freqs = torch.exp(
             -math.log(self.max_period)

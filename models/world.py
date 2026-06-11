@@ -13,18 +13,19 @@ class World(nn.Module):
         self.latest_state = None
         self.horizon = horizon
 
-    def forward(self, actions, observations, ctx_frames=None):
+    def forward(self, actions, observations, ctx_frames=None, run_euler=False):
         '''
         Training forward pass with flow matching dynamics.
 
         action: (B, T-1, Action space)
         observations: (B, T, C, H, W)
         ctx_frames: int — number of real frames used as context
+        run_euler: bool — whether to compute Euler predicted next states (slow, for debugging/logging)
 
         Returns:
             states:        (B, T, D)     all encoded states
             target_state:  (B, T-1, D)   ground-truth next states (encoder outputs)
-            euler_pred:    (B, T-1, D)   Euler-predicted states (for recon visualization only)
+            euler_full:    (B, T-1, D)   Euler-predicted states (or None if run_euler=False)
             rewards:       (B, T-1, 1)   predicted rewards (from target states)
             terminals:     (B, T-1, 1)   predicted terminals (from target states)
             velocity_loss: scalar        CFM velocity matching loss
@@ -51,9 +52,14 @@ class World(nn.Module):
             future_targets = target_state
             future_action_emb = action_embedding
 
+        # Source for state-to-state flow matching: last context state,
+        # broadcast across the future prediction horizon
+        source_states = ctx_states[:, -1:].expand_as(future_targets)
+
         # Velocity matching loss (trains the velocity network)
+        # Detach states to prevent flow matching gradients from flowing into the vision model.
         velocity_loss = self.dynamics(
-            ctx_states, future_action_emb, future_targets
+            ctx_states.detach(), future_action_emb, future_targets.detach(), source_states.detach()
         )
 
         # Reward/term heads train on TARGET states (encoder outputs) — always
@@ -62,17 +68,19 @@ class World(nn.Module):
         rewards = self.reward(target_state)
         terminals = self.termination(target_state)
 
-        # Euler solve for reconstruction visualization only (no grad needed)
-        with torch.no_grad():
-            euler_pred = self.dynamics.generate(
-                ctx_states, future_action_emb
-            )  # (B, H, D)
-            # Pad to full T_act length for visualization
-            if ctx_frames > 1:
-                euler_full = torch.cat([current_states[:, 1:ctx_frames], euler_pred], dim=1)
-            else:
-                euler_full = euler_pred
-            euler_full = euler_full[:, :T_act]
+        # Euler solve for reconstruction visualization and loss (no grad needed)
+        euler_full = None
+        if run_euler:
+            with torch.no_grad():
+                euler_pred = self.dynamics.generate(
+                    ctx_states, future_action_emb
+                )  # (B, H, D)
+                # Pad to full T_act length for visualization / loss
+                if ctx_frames > 1:
+                    euler_full = torch.cat([current_states[:, 1:ctx_frames], euler_pred], dim=1)
+                else:
+                    euler_full = euler_pred
+                euler_full = euler_full[:, :T_act]
 
         return states, target_state, euler_full, rewards, terminals, velocity_loss
     
@@ -194,7 +202,7 @@ if __name__ == "__main__":
     vision = VisionEncoder(latent_dim=latent_dim, hidden_dim=hidden_dim)
     action_encoder = ActionEncoder(action_space=action_space, hidden_dim=hidden_dim, output_dim=latent_dim)
     dynamics = FlowMatchingDynamics(
-        max_frames=horizon,
+        max_frames=horizon + 10,
         action_dim=latent_dim,
         hidden_dim=latent_dim,
         num_layers=6,

@@ -37,6 +37,7 @@ class Config:
     dyn_num_heads: int = 4
     dyn_causal: bool = False
     flow_num_euler_steps: int = 6
+    flow_source_noise_sigma: float = 0.0
     
     max_frames: int = 18
     world_horizon: int = 15
@@ -57,6 +58,7 @@ class Config:
     amp_dtype: str = 'bfloat16' 
     value_target_tau: float = 0.02
     
+    use_sigreg: bool = False
     sigreg_weight: float = 0.1
     weak_sigreg: bool = True     # if True, use WeakSIGReg (Frobenius cov loss) instead of SIGReg
     entropy_scale: float = 3e-3
@@ -102,10 +104,13 @@ class Config:
                 f"sig{self.sigreg_weight}"
             ]
             
-            if self.weak_sigreg:
-                parts.append("weaksig")
+            if self.use_sigreg:
+                if self.weak_sigreg:
+                    parts.append("weaksig")
+                else:
+                    parts.append("sigreg")
             else:
-                parts.append("sigreg")
+                parts.append("nosig")
                 
             if self.use_return_ema:
                 parts.append("ema")
@@ -179,7 +184,8 @@ class Trainer:
             max_frames=cfg.max_frames + cfg.imagination_ctx_frames,
             action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim,
             num_layers=cfg.dyn_num_layers, num_heads=cfg.dyn_num_heads,
-            causal=cfg.dyn_causal, num_euler_steps=cfg.flow_num_euler_steps
+            causal=cfg.dyn_causal, num_euler_steps=cfg.flow_num_euler_steps,
+            source_noise_sigma=cfg.flow_source_noise_sigma,
         )
         reward_enc = Reward(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         termination_enc = Termination(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
@@ -222,10 +228,11 @@ class Trainer:
 
         # Diagnostics
         if cfg.diag_enabled:
-            from diagnostics import LossLandscapeVisualizer, GradientFlowAnalyzer, ActionDistributionMonitor
+            from diagnostics import LossLandscapeVisualizer, GradientFlowAnalyzer, ActionDistributionMonitor, FlowDiagnostics
             self.landscape_viz = LossLandscapeVisualizer(self)
             self.grad_analyzer = GradientFlowAnalyzer(self)
             self.action_monitor = ActionDistributionMonitor(self)
+            self.flow_diagnostics = FlowDiagnostics(self)
             self.diag_output_dir = os.path.join(cfg.log_dir, 'diagnostics')
 
     def set_seed(self, seed):
@@ -460,9 +467,11 @@ class Trainer:
         
         self.world.unfreeze()
         
+        log_recon = self.cfg.recon_debug and (self.world_step % self.cfg.train_steps == 0)
+        
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             raw_states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss = self.world(
-                act_batch, obs_batch, ctx_frames=self.cfg.imagination_ctx_frames
+                act_batch, obs_batch, ctx_frames=self.cfg.imagination_ctx_frames, run_euler=log_recon
             )
             
             recon_loss = None
@@ -470,25 +479,36 @@ class Trainer:
             if self.cfg.recon_debug:
                 if self.cfg.recon_train:
                     recon_obs = self.world.decoder(raw_states)
-                    recon_pred_obs = self.world.decoder(pred_next_state)
                 else:
                     recon_obs = self.world.decoder(raw_states.detach())
-                    recon_pred_obs = self.world.decoder(pred_next_state.detach())
                     
                 recon_loss = F.mse_loss(recon_obs.float(), obs_batch.float())
-                recon_pred_loss = F.mse_loss(recon_pred_obs.float(), obs_batch[:, 1:].float())
-                total_recon_loss = recon_loss + recon_pred_loss
+                total_recon_loss = recon_loss
+                
+                if log_recon and pred_next_state is not None:
+                    if self.cfg.recon_train:
+                        recon_pred_obs = self.world.decoder(pred_next_state)
+                    else:
+                        recon_pred_obs = self.world.decoder(pred_next_state.detach())
+                    recon_pred_loss = F.mse_loss(recon_pred_obs.float(), obs_batch[:, 1:].float())
             
         # Flow matching velocity loss replaces the old MSE dynamics loss
         dyn_loss = velocity_loss
         rew_loss = F.mse_loss(pred_rewards.float(), sym_rew_batch[:, 1:].float())
         term_loss = F.binary_cross_entropy_with_logits(pred_terminals.float(), term_batch[:, 1:].float())
-        sig_loss = self.sig_reg(raw_states.transpose(0, 1).float())
+        
+        if self.cfg.use_sigreg:
+            sig_loss = self.sig_reg(raw_states.transpose(0, 1).float())
+        else:
+            sig_loss = torch.tensor(0.0, device=self.device)
         
         if self.cfg.recon_debug:
-            wm_loss = dyn_loss + rew_loss + term_loss + self.cfg.sigreg_weight * sig_loss + total_recon_loss
+            wm_loss = dyn_loss + rew_loss + term_loss + total_recon_loss
         else:
-            wm_loss = dyn_loss + rew_loss + term_loss + self.cfg.sigreg_weight * sig_loss
+            wm_loss = dyn_loss + rew_loss + term_lossvisualise
+            
+        if self.cfg.use_sigreg:
+            wm_loss = wm_loss + self.cfg.sigreg_weight * sig_loss
         
         # Compute individual grad norms for world model losses
         scale_factor = self.scaler.get_scale()
@@ -509,9 +529,12 @@ class Trainer:
         term_grad_norm = self._compute_grad_norm(self.world) / scale_factor
         
         # SIGReg Loss
-        self.world_opt.zero_grad(set_to_none=True)
-        self.scaler.scale(self.cfg.sigreg_weight * sig_loss).backward(retain_graph=True)
-        sig_grad_norm = self._compute_grad_norm(self.world) / scale_factor
+        if self.cfg.use_sigreg:
+            self.world_opt.zero_grad(set_to_none=True)
+            self.scaler.scale(self.cfg.sigreg_weight * sig_loss).backward(retain_graph=True)
+            sig_grad_norm = self._compute_grad_norm(self.world) / scale_factor
+        else:
+            sig_grad_norm = 0.0
             
         # Reconstruction Loss
         if self.cfg.recon_debug:
@@ -541,7 +564,8 @@ class Trainer:
         
         if self.cfg.recon_debug:
             self.writer.add_scalar('Loss/World_Reconstruction', recon_loss.item(), self.world_step)
-            self.writer.add_scalar('Loss/World_Reconstruction_Pred', recon_pred_loss.item(), self.world_step)
+            if recon_pred_loss is not None:
+                self.writer.add_scalar('Loss/World_Reconstruction_Pred', recon_pred_loss.item(), self.world_step)
             self.writer.add_scalar('GradNorm/World_Reconstruction', recon_grad_norm, self.world_step)
             
         self.writer.add_scalar('GradNorm/World', grad_norm, self.world_step)
@@ -549,21 +573,44 @@ class Trainer:
         self.writer.add_scalar('GradNorm/World_Reward', rew_grad_norm, self.world_step)
         
         if self.cfg.recon_debug and (self.world_step % self.cfg.train_steps == 0):
-            self.visualize_reconstruction(obs_batch, recon_obs, recon_pred_obs, raw_states, pred_next_state)
+            self.visualize_reconstruction(obs_batch, raw_states, act_batch)
             
         self.world_step += 1
         
         return raw_states.detach(), act_batch.detach(), wm_loss.item()
 
     @torch.no_grad()
-    def visualize_reconstruction(self, obs_batch, recon_obs, recon_pred_obs, raw_states, pred_next_state):
-        
+    def visualize_reconstruction(self, obs_batch, raw_states, act_batch):
         idx = random.randint(0, obs_batch.size(0) - 1)
         ctx = self.cfg.imagination_ctx_frames
         
+        # 1. Decode raw_states for reconstruction of encoded/clean states
+        recon_obs = self.world.decoder(raw_states[idx:idx+1].detach())
         actual = obs_batch[idx, ctx:].detach().cpu()
-        encoded = recon_obs[idx, ctx:].detach().cpu()
-        pred_aligned = recon_pred_obs[idx, ctx-1:].detach().cpu()
+        encoded = recon_obs[0, ctx:].detach().cpu()
+        
+        # 2. Perform a full rollout to predict next states
+        ctx_states = raw_states[idx:idx+1, :ctx] # (1, ctx, D)
+        
+        # Extract action sequence for this item
+        actions_idx = act_batch[idx:idx+1, ctx-1:] # (1, T-ctx, AS)
+        
+        # Embed actions
+        AS = actions_idx.shape[-1]
+        action_embedding = self.world.action(actions_idx.reshape(-1, AS)).reshape(1, actions_idx.size(1), -1)
+        
+        # Euler solve
+        euler_pred = self.world.dynamics.generate(ctx_states, action_embedding) # (1, T-ctx, D)
+        
+        # Align/pad to match predicted next states format
+        if ctx > 1:
+            pred_next_state = torch.cat([raw_states[idx:idx+1, 1:ctx], euler_pred], dim=1) # (1, T-1, D)
+        else:
+            pred_next_state = euler_pred # (1, T-1, D)
+            
+        # Decode predicted next states
+        recon_pred_obs = self.world.decoder(pred_next_state.detach()) # (1, T-1, C, H, W)
+        pred_aligned = recon_pred_obs[0, ctx-1:].detach().cpu()
 
         # Calculate predicted values for encoded and predicted states
         states_idx = raw_states[idx:idx+1].transpose(0, 1) # (T, 1, D)
@@ -574,7 +621,7 @@ class Trainer:
                 enc_vals_raw = symexp(enc_vals_raw)
             enc_values = enc_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()[ctx:] # shape (T-ctx,)
 
-        pred_states_idx = torch.cat([raw_states[idx:idx+1, 0:1], pred_next_state[idx:idx+1]], dim=1).transpose(0, 1) # (T, 1, D)
+        pred_states_idx = torch.cat([raw_states[idx:idx+1, 0:1], pred_next_state], dim=1).transpose(0, 1) # (T, 1, D)
         pred_windows = self._get_history_windows(pred_states_idx, self.cfg.agent_horizon, context=None) # (T, 1, agent_horizon * D)
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             pred_vals_raw = self.value_model(pred_windows)
@@ -630,6 +677,51 @@ class Trainer:
         
         combined_grid = torch.cat([grid_actual, grid_encoded, grid_pred], dim=1)
         self.writer.add_image('Reconstruction/Actual_vs_Encoded_vs_Predicted', combined_grid, self.world_step)
+        
+        # --- Velocity field diagnostics ---
+        # Uses the same ctx_states / action_embedding already computed above
+        # Compute future targets: encoded states after context, matching world.forward slicing
+        target_states_all = raw_states[idx:idx+1, 1:]  # (1, T-1, D)
+        future_targets = target_states_all[:, ctx-1:]    # (1, H, D)
+        source = ctx_states[:, -1:].expand_as(euler_pred)  # (1, H, D)
+        v_gt = future_targets - source  # ground truth velocity
+        
+        # Check: does predicted velocity vary with t? (shouldn't for OT-CFM)
+        v_at_0 = self.world.dynamics.compute_velocity(
+            source.clone(), torch.zeros(1, device=source.device), ctx_states, action_embedding
+        )
+        v_at_05 = self.world.dynamics.compute_velocity(
+            0.5 * source + 0.5 * future_targets,
+            torch.full((1,), 0.5, device=source.device), ctx_states, action_embedding
+        )
+        v_at_09 = self.world.dynamics.compute_velocity(
+            0.1 * source + 0.9 * future_targets,
+            torch.full((1,), 0.9, device=source.device), ctx_states, action_embedding
+        )
+        
+        # MSE of velocity prediction at different t values
+        mse_t0 = (v_at_0 - v_gt).pow(2).mean().item()
+        mse_t05 = (v_at_05 - v_gt).pow(2).mean().item()
+        mse_t09 = (v_at_09 - v_gt).pow(2).mean().item()
+        self.writer.add_scalar('Diag/Velocity_MSE_t0', mse_t0, self.world_step)
+        self.writer.add_scalar('Diag/Velocity_MSE_t05', mse_t05, self.world_step)
+        self.writer.add_scalar('Diag/Velocity_MSE_t09', mse_t09, self.world_step)
+        
+        # Cosine similarity at t=0 (inference regime)
+        cos_t0 = torch.nn.functional.cosine_similarity(
+            v_at_0.reshape(1, -1), v_gt.reshape(1, -1), dim=1
+        ).item()
+        self.writer.add_scalar('Diag/Velocity_Cosine_t0', cos_t0, self.world_step)
+        
+        # Per-position diversity of Euler output
+        euler_pos_var = euler_pred.var(dim=1).mean().item()
+        target_pos_var = future_targets.var(dim=1).mean().item()
+        self.writer.add_scalar('Diag/Euler_PositionVariance', euler_pos_var, self.world_step)
+        self.writer.add_scalar('Diag/Target_PositionVariance', target_pos_var, self.world_step)
+        
+        # Euler MSE to target
+        euler_mse = (euler_pred - future_targets).pow(2).mean().item()
+        self.writer.add_scalar('Diag/Euler_MSE_to_Target', euler_mse, self.world_step)
 
     def train_agent(self, start_states, real_actions):
         """
@@ -850,6 +942,14 @@ class Trainer:
         self.value_model.eval()
 
         try:
+            # 0. Flow matching diagnostics (PCA trajectories and velocity fields)
+            flow_data = self.flow_diagnostics.collect_flow_data(start_states, real_actions)
+            fig_traj = self.flow_diagnostics.plot_flow_trajectories(flow_data, save_dir=save_dir)
+            if fig_traj is not None:
+                self.writer.add_figure('Diag/Flow_Trajectories', fig_traj, step)
+            self.writer.add_scalar('Diag/Flow_Cosine_Sim_t0', flow_data['cos_sim'], step)
+            self.writer.add_scalar('Diag/Flow_Dist_to_Target_Mean', flow_data['dist_to_target'], step)
+
             # 1. Action distribution stats (fast)
             action_stats = self.action_monitor.collect_action_stats(start_states, real_actions)
             self.action_monitor.plot_action_stats(action_stats, save_dir=save_dir)

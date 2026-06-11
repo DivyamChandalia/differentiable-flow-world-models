@@ -93,7 +93,7 @@ class GradientFlowAnalyzer:
     # Finite-difference vs analytical gradient comparison
     # ------------------------------------------------------------------
 
-    def finite_difference_check(self, start_states, real_actions, epsilon=1e-3, num_params=20):
+    def finite_difference_check(self, start_states, real_actions, epsilon=1e-4, num_params=20):
         """
         Compare analytical gradients to finite-difference approximations
         for a random subset of actor parameters. Large discrepancies
@@ -106,14 +106,42 @@ class GradientFlowAnalyzer:
         viz = LossLandscapeVisualizer(self.trainer)
         
         actor = self.trainer.actor
+        world = self.trainer.world
+        value_model = self.trainer.value_model
+        target_value_model = self.trainer.target_value_model
+        actor_loss_fn = self.trainer.actor_loss_fn
+        value_loss_fn = self.trainer.value_loss_fn
+        return_ema = self.trainer.return_ema
+
+        orig_device = self.device
+        cpu_device = torch.device('cpu')
 
         with torch.no_grad():
             original_params = viz._get_params_as_vector(actor).clone()
 
-        # First, compute analytical gradient (needs grad enabled)
-        viz._run_actor_forward_with_grad(start_states.detach(), real_actions.detach())
+        # Temporarily set devices to CPU
+        self.device = cpu_device
+        self.trainer.device = cpu_device
+        viz.device = cpu_device
+
+        # Move models to CPU and cast to double precision (float64)
+        actor.to(cpu_device).double()
+        world.to(cpu_device).double()
+        value_model.to(cpu_device).double()
+        target_value_model.to(cpu_device).double()
+        actor_loss_fn.to(cpu_device).double()
+        value_loss_fn.to(cpu_device).double()
+        if return_ema is not None:
+            return_ema.to(cpu_device).double()
+
+        # Convert input tensors to double precision on CPU
+        states_db = start_states.detach().cpu().double()
+        actions_db = real_actions.detach().cpu().double()
+
+        # Compute analytical gradient in double precision
+        viz._run_actor_forward_with_grad(states_db, actions_db)
         analytical_grad = torch.cat([
-            p.grad.flatten() if p.grad is not None else torch.zeros(p.numel(), device=self.device)
+            p.grad.flatten() if p.grad is not None else torch.zeros(p.numel(), device=cpu_device, dtype=torch.float64)
             for p in actor.parameters()
         ]).clone()
 
@@ -121,28 +149,45 @@ class GradientFlowAnalyzer:
         total_params = original_params.numel()
         indices = torch.randperm(total_params)[:num_params]
 
-        analytical_vals = analytical_grad[indices].cpu().float().numpy()
+        analytical_vals = analytical_grad[indices].cpu().numpy()
         numerical_vals = np.zeros(num_params)
 
-        # FD perturbation loop — no grad needed
+        # FD perturbation loop — no grad needed, in double precision
         with torch.no_grad():
+            # Flat param vector in double
+            params_db = viz._get_params_as_vector(actor).clone()
             for k, idx in enumerate(indices):
                 # f(θ + ε*e_i)
-                perturbed_plus = original_params.clone()
+                perturbed_plus = params_db.clone()
                 perturbed_plus[idx] += epsilon
                 viz._set_params_from_vector(actor, perturbed_plus)
-                loss_plus, _, _ = viz._evaluate_actor_loss(start_states, real_actions)
+                loss_plus, _, _ = viz._evaluate_actor_loss(states_db, actions_db)
 
                 # f(θ - ε*e_i)
-                perturbed_minus = original_params.clone()
+                perturbed_minus = params_db.clone()
                 perturbed_minus[idx] -= epsilon
                 viz._set_params_from_vector(actor, perturbed_minus)
-                loss_minus, _, _ = viz._evaluate_actor_loss(start_states, real_actions)
+                loss_minus, _, _ = viz._evaluate_actor_loss(states_db, actions_db)
 
                 numerical_vals[k] = (loss_plus - loss_minus) / (2 * epsilon)
 
-            # Restore
+            # Restore original parameters to actor
             viz._set_params_from_vector(actor, original_params)
+
+        # Move models back to original device and restore float32
+        actor.to(orig_device).float()
+        world.to(orig_device).float()
+        value_model.to(orig_device).float()
+        target_value_model.to(orig_device).float()
+        actor_loss_fn.to(orig_device).float()
+        value_loss_fn.to(orig_device).float()
+        if return_ema is not None:
+            return_ema.to(orig_device).float()
+
+        # Restore devices
+        self.device = orig_device
+        self.trainer.device = orig_device
+        viz.device = orig_device
 
         # Compute agreement metrics
         a_tensor = torch.tensor(analytical_vals)
@@ -152,7 +197,7 @@ class GradientFlowAnalyzer:
             a_tensor.unsqueeze(0), n_tensor.unsqueeze(0)
         ).item()
 
-        denom = np.maximum(np.abs(analytical_vals) + np.abs(numerical_vals), 1e-10)
+        denom = np.maximum(np.abs(analytical_vals) + np.abs(numerical_vals), 1e-15)
         relative_error = np.mean(np.abs(analytical_vals - numerical_vals) / denom)
 
         return {
