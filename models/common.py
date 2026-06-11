@@ -183,7 +183,15 @@ class AdaLNTransformerBlock(nn.Module):
         )
 
         nn.init.zeros_(self.adaln_modulation[-1].weight)
-        nn.init.zeros_(self.adaln_modulation[-1].bias)
+        # Initialize gate biases to small positive values so the network
+        # isn't a pure identity at init (critical for flow matching velocity).
+        # Bias layout: [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
+        bias = self.adaln_modulation[-1].bias
+        nn.init.zeros_(bias)
+        gate_dim = bias.shape[0] // 6
+        with torch.no_grad():
+            bias[2 * gate_dim : 3 * gate_dim] = 0.1   # gate_msa
+            bias[5 * gate_dim : 6 * gate_dim] = 0.1   # gate_mlp
 
     def forward(self, x, c, freqs_cis, kv_cache=None):
         (shift_msa, scale_msa, gate_msa, 
@@ -206,17 +214,73 @@ class AdaLNTransformerBlock(nn.Module):
 
         return x, new_kv_cache
 
+
+class AdditiveCondTransformerBlock(nn.Module):
+    """Transformer block with explicit additive conditioning injection.
+    
+    Instead of AdaLN (scale/shift/gate modulation), the conditioning signal
+    is projected and **added directly** into the residual stream before each
+    sub-layer.  This provides a more direct, explicit conditioning path:
+    
+        x = x + cond_proj(c)   (before attention)
+        x = x + attn(norm(x))
+        x = x + cond_proj(c)   (before MLP)
+        x = x + mlp(norm(x))
+    
+    Advantages over AdaLN:
+      • No gating — signal flows through immediately at init
+      • Conditioning is content-level, not just normalization modulation
+      • Standard init (Xavier) means non-trivial conditioning from step 0
+    """
+    def __init__(self, dim, num_heads, cond_dim, mlp_ratio=4.0, causal=True):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+        self.attn = SelfAttention(dim, num_heads, causal=causal)
+        
+        mlp_hidden_dim = int(dim * mlp_ratio * (2/3))
+        self.mlp = SwiGLUMLP(dim, mlp_hidden_dim)
+        
+        # Conditioning projections: cond_dim → dim (additive injection)
+        # One per sub-layer so each gets a distinct conditioning signal.
+        self.cond_proj_attn = nn.Linear(cond_dim, dim)
+        self.cond_proj_mlp = nn.Linear(cond_dim, dim)
+
+    def forward(self, x, c, freqs_cis, kv_cache=None):
+        # Inject conditioning before attention (additive)
+        x = x + self.cond_proj_attn(c)
+        attn_out, new_kv_cache = self.attn(
+            self.norm1(x),
+            freqs_cis=freqs_cis,
+            kv_cache=kv_cache
+        )
+        x = x + attn_out
+
+        # Inject conditioning before MLP (additive)
+        x = x + self.cond_proj_mlp(c)
+        x = x + self.mlp(self.norm2(x))
+
+        return x, new_kv_cache
+
+
 class ConditionalTransformer(nn.Module):
-    def __init__(self, depth, dim, num_heads, cond_dim, seq_len, window_size=None, causal=True):
+    def __init__(self, depth, dim, num_heads, cond_dim, seq_len,
+                 window_size=None, causal=True, block_type='adaln'):
         super().__init__()
         self.window_size = window_size
         self.head_dim = dim // num_heads
         
         freqs_cis = precompute_freqs_cis(self.head_dim, seq_len)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
-        
+
+        if block_type == 'additive':
+            BlockClass = AdditiveCondTransformerBlock
+        else:
+            BlockClass = AdaLNTransformerBlock
+
         self.blocks = nn.ModuleList([
-            AdaLNTransformerBlock(dim, num_heads, cond_dim, causal=causal) 
+            BlockClass(dim, num_heads, cond_dim, causal=causal) 
             for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(dim)

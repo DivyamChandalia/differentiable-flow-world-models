@@ -56,10 +56,11 @@ class World(nn.Module):
         # broadcast across the future prediction horizon
         source_states = ctx_states[:, -1:].expand_as(future_targets)
 
-        # Velocity matching loss (trains the velocity network)
-        # Detach states to prevent flow matching gradients from flowing into the vision model.
+        # Velocity matching loss (trains the velocity network).
+        # No detach — flow matching gradients flow into the vision encoder,
+        # encouraging dynamics-aware representations.
         velocity_loss = self.dynamics(
-            ctx_states.detach(), future_action_emb, future_targets.detach(), source_states.detach()
+            ctx_states, future_action_emb, future_targets, source_states
         )
 
         # Reward/term heads train on TARGET states (encoder outputs) — always

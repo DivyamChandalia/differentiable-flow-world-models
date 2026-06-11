@@ -35,9 +35,10 @@ class Config:
     hidden_dim: int = 256
     dyn_num_layers: int = 6
     dyn_num_heads: int = 4
-    dyn_causal: bool = False
+    dyn_causal: bool = True
     flow_num_euler_steps: int = 6
     flow_source_noise_sigma: float = 0.0
+    flow_loss_weight: float = 1.0
     
     max_frames: int = 18
     world_horizon: int = 15
@@ -58,8 +59,8 @@ class Config:
     amp_dtype: str = 'bfloat16' 
     value_target_tau: float = 0.02
     
-    use_sigreg: bool = False
-    sigreg_weight: float = 0.1
+    use_sigreg: bool = True
+    sigreg_weight: float = 1
     weak_sigreg: bool = True     # if True, use WeakSIGReg (Frobenius cov loss) instead of SIGReg
     entropy_scale: float = 3e-3
     use_return_ema: bool = True
@@ -72,7 +73,7 @@ class Config:
 
     buffer_capacity: int = 150
     prefill_episodes: int = 50
-    world_bootstrap_steps: int = 1500  # extra WM-only gradient steps run after prefill, before training loop
+    world_bootstrap_steps: int = 500  # extra WM-only gradient steps run after prefill, before training loop
     
     recon_debug: bool = True
     recon_train: bool = False
@@ -493,7 +494,7 @@ class Trainer:
                     recon_pred_loss = F.mse_loss(recon_pred_obs.float(), obs_batch[:, 1:].float())
             
         # Flow matching velocity loss replaces the old MSE dynamics loss
-        dyn_loss = velocity_loss
+        dyn_loss = self.cfg.flow_loss_weight * velocity_loss
         rew_loss = F.mse_loss(pred_rewards.float(), sym_rew_batch[:, 1:].float())
         term_loss = F.binary_cross_entropy_with_logits(pred_terminals.float(), term_batch[:, 1:].float())
         

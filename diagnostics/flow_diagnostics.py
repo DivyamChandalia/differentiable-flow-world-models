@@ -78,8 +78,11 @@ class FlowDiagnostics:
             K = trainer.world.dynamics.num_euler_steps
             dt = 1.0 / K
 
-            # Start integration at t=0 (source states, clean/no-noise for clean trajectory plots)
+            # Start integration at t=0 — add source noise to match inference
             z = ctx_windows[:, -1:].expand(-1, H, -1).clone()
+            sigma = trainer.world.dynamics.source_noise_sigma
+            if sigma > 0:
+                z = z + sigma * torch.randn_like(z)
 
             trajectory = [z.clone()]
             velocities = []
@@ -92,7 +95,8 @@ class FlowDiagnostics:
                 trajectory.append(z.clone())
 
         # Optimal Transport (OT) linear interpolation for comparison
-        z_0 = ctx_windows[:, -1:].expand(-1, H, -1)
+        # Uses the same noisy source as the integration for fair comparison
+        z_0 = trajectory[0]  # already has noise applied
         z_1 = future_targets
         ot_trajectory = []
         for k in range(K + 1):
@@ -137,6 +141,11 @@ class FlowDiagnostics:
             z_1_all = start_states[:, ctx:]
             
             z_all = z_0_all.clone()
+            # Add source noise to match inference
+            sigma = trainer.world.dynamics.source_noise_sigma
+            if sigma > 0:
+                z_all = z_all + sigma * torch.randn_like(z_all)
+            
             act_emb_all = trainer.world.action(real_actions[:, ctx-1:].reshape(-1, A)).reshape(B_wm, T-ctx, -1)
             
             v_all_list = []
