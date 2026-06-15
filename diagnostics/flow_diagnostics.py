@@ -185,16 +185,38 @@ class FlowDiagnostics:
             ax.plot(ctx[:, 0], ctx[:, 1], 'g-o', markersize=5, label='Context', alpha=0.8)
             ax.plot(ctx[-1, 0], ctx[-1, 1], 'bo', markersize=7, label='t=0 Start')
             
+            # Context transition arrows (chronological sequence)
+            for j in range(len(ctx) - 1):
+                ax.annotate('', xy=(ctx[j+1, 0], ctx[j+1, 1]), xytext=(ctx[j, 0], ctx[j, 1]),
+                            arrowprops=dict(arrowstyle="-|>", color='green', lw=1.2, alpha=0.5, mutation_scale=8))
+            
             targets = seq_data['target_proj']
             ax.scatter(targets[:, 0], targets[:, 1], color='red', marker='*', s=80, label='Targets', zorder=5)
+            
+            # Chronological target transitions (ctx[-1] -> targets[0] -> targets[1] -> ...)
+            if len(targets) > 0:
+                ax.annotate('', xy=(targets[0, 0], targets[0, 1]), xytext=(ctx[-1, 0], ctx[-1, 1]),
+                            arrowprops=dict(arrowstyle="-|>", color='red', linestyle=':', lw=1.2, alpha=0.4, mutation_scale=8))
+                for h in range(len(targets) - 1):
+                    ax.annotate('', xy=(targets[h+1, 0], targets[h+1, 1]), xytext=(targets[h, 0], targets[h, 1]),
+                                arrowprops=dict(arrowstyle="-|>", color='red', linestyle=':', lw=1.2, alpha=0.4, mutation_scale=8))
             
             traj = seq_data['traj_proj']
             ot = seq_data['ot_proj']
             
             H = targets.shape[0]
             for h in range(H):
+                # OT flow matching transition path (ground truth straight line)
                 ax.plot(ot[:, h, 0], ot[:, h, 1], 'k--', alpha=0.15)
+                if ot.shape[0] > 1:
+                    ax.annotate('', xy=(ot[-1, h, 0], ot[-1, h, 1]), xytext=(ot[-2, h, 0], ot[-2, h, 1]),
+                                arrowprops=dict(arrowstyle="-|>", color='black', alpha=0.25, lw=1.0, mutation_scale=8))
+                
+                # Model predicted flow matching trajectory
                 ax.plot(traj[:, h, 0], traj[:, h, 1], 'b-', alpha=0.5)
+                if traj.shape[0] > 1:
+                    ax.annotate('', xy=(traj[-1, h, 0], traj[-1, h, 1]), xytext=(traj[-2, h, 0], traj[-2, h, 1]),
+                                arrowprops=dict(arrowstyle="-|>", color='blue', alpha=0.4, lw=1.2, mutation_scale=8))
                 
             ax.set_xlabel('PCA Dim 1')
             ax.set_ylabel('PCA Dim 2')
@@ -208,9 +230,20 @@ class FlowDiagnostics:
             ax_detail.plot(ctx[:, 0], ctx[:, 1], 'g-o', markersize=5, alpha=0.5)
             ax_detail.plot(ctx[-1, 0], ctx[-1, 1], 'bo', markersize=7, label='t=0 Start')
             
+            # Context transition arrows in detail view
+            for j in range(len(ctx) - 1):
+                ax_detail.annotate('', xy=(ctx[j+1, 0], ctx[j+1, 1]), xytext=(ctx[j, 0], ctx[j, 1]),
+                                   arrowprops=dict(arrowstyle="-|>", color='green', lw=1.0, alpha=0.3, mutation_scale=8))
+            
             h_det = H - 1
             ax_detail.scatter(targets[h_det, 0], targets[h_det, 1], color='red', marker='*', s=120, label='Target', zorder=5)
             ax_detail.plot(ot[:, h_det, 0], ot[:, h_det, 1], 'k--', alpha=0.3, label='OT Path')
+            
+            # OT arrow at the end pointing to target state
+            if ot.shape[0] > 1:
+                ax_detail.annotate('', xy=(ot[-1, h_det, 0], ot[-1, h_det, 1]), xytext=(ot[-2, h_det, 0], ot[-2, h_det, 1]),
+                                   arrowprops=dict(arrowstyle="-|>", color='black', alpha=0.4, lw=1.2, mutation_scale=10))
+            
             ax_detail.plot(traj[:, h_det, 0], traj[:, h_det, 1], 'b-', linewidth=2, label='Pred Traj')
             ax_detail.scatter(traj[:, h_det, 0], traj[:, h_det, 1], color='blue', s=20, alpha=0.6)
             
