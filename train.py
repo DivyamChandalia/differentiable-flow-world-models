@@ -48,6 +48,9 @@ class Config:
     flow_loss_weight: float = 1.0
     flow_detach_encoder: bool = True    # Stop-grad encoder outputs for flow model
     flow_distill_from_ar: bool = False  # If True, flow trains on AR predictions instead of encoder outputs
+    flow_cfg_dropout: float = 0.15      # Probability of dropping context during flow training (CFG)
+    flow_cfg_scale: float = 3.0         # CFG extrapolation scale during actor imagination
+    flow_standardize_latents: bool = True # Standardize latents to standard normal for flow model
     
     max_frames: int = 18
     world_horizon: int = 15
@@ -490,6 +493,9 @@ class Trainer:
                 act_batch, obs_batch, ctx_frames=self.cfg.imagination_ctx_frames, run_euler=log_recon,
                 flow_detach_encoder=self.cfg.flow_detach_encoder,
                 flow_distill_from_ar=self.cfg.flow_distill_from_ar,
+                flow_standardize_latents=self.cfg.flow_standardize_latents,
+                flow_cfg_dropout=self.cfg.flow_cfg_dropout,
+                flow_cfg_scale=self.cfg.flow_cfg_scale,
             )
             
             recon_loss = None
@@ -640,7 +646,16 @@ class Trainer:
         ar_aligned = recon_ar_pred_obs[0, ctx-1:].detach().cpu()
         
         # 3. Flow matching Euler predictions
-        euler_pred = self.world.dynamics_flow.generate(ctx_states, action_embedding)  # (1, T-ctx, D)
+        if self.cfg.flow_standardize_latents:
+            ctx_states_norm = self.world.latent_rms.normalize(ctx_states)
+            euler_pred_norm = self.world.dynamics_flow.generate(
+                ctx_states_norm, action_embedding, cfg_scale=self.cfg.flow_cfg_scale
+            )
+            euler_pred = self.world.latent_rms.denormalize(euler_pred_norm)
+        else:
+            euler_pred = self.world.dynamics_flow.generate(
+                ctx_states, action_embedding, cfg_scale=self.cfg.flow_cfg_scale
+            )
         
         # Align/pad to match predicted next states format
         if ctx > 1:
@@ -817,7 +832,9 @@ class Trainer:
             # 1-step parallel generation pass
             imagined_states, imagined_rewards, imagined_terminals = self.world.generate_chunk(
                 actions=actions_full,
-                start_states=ctx_windows
+                start_states=ctx_windows,
+                flow_standardize_latents=self.cfg.flow_standardize_latents,
+                flow_cfg_scale=self.cfg.flow_cfg_scale,
             )
 
             history_windows = self._get_history_windows(imagined_states, self.cfg.agent_horizon, context=ctx_windows)

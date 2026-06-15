@@ -84,15 +84,35 @@ class FlowDiagnostics:
             if sigma > 0:
                 z = z + sigma * torch.randn_like(z)
 
+            # Normalize if needed
+            std_l = cfg.flow_standardize_latents
+            if std_l:
+                ctx_windows_norm = trainer.world.latent_rms.normalize(ctx_windows)
+                z = trainer.world.latent_rms.normalize(z)
+            else:
+                ctx_windows_norm = ctx_windows
+
             trajectory = [z.clone()]
             velocities = []
+            cfg_scale = cfg.flow_cfg_scale
 
             for k in range(K):
                 t_k = torch.full((z.size(0),), k * dt, device=z.device, dtype=z.dtype)
-                v = trainer.world.dynamics_flow.compute_velocity(z, t_k, ctx_windows, action_embedding)
+                if cfg_scale != 1.0:
+                    v_cond = trainer.world.dynamics_flow.compute_velocity(z, t_k, ctx_windows_norm, action_embedding, drop_ctx=False)
+                    v_uncond = trainer.world.dynamics_flow.compute_velocity(z, t_k, ctx_windows_norm, action_embedding, drop_ctx=True)
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                else:
+                    v = trainer.world.dynamics_flow.compute_velocity(z, t_k, ctx_windows_norm, action_embedding)
                 velocities.append(v)
                 z = z + dt * v
                 trajectory.append(z.clone())
+
+            # Denormalize trajectories and velocities
+            if std_l:
+                trajectory = [trainer.world.latent_rms.denormalize(t_step) for t_step in trajectory]
+                std_tensor = torch.sqrt(trainer.world.latent_rms.var + trainer.world.latent_rms.epsilon)
+                velocities = [v_step * std_tensor for v_step in velocities]
 
         # Optimal Transport (OT) linear interpolation for comparison
         # Uses the same noisy source as the integration for fair comparison
@@ -145,15 +165,34 @@ class FlowDiagnostics:
             sigma = trainer.world.dynamics_flow.source_noise_sigma
             if sigma > 0:
                 z_all = z_all + sigma * torch.randn_like(z_all)
+
+            if std_l:
+                z_all_norm = trainer.world.latent_rms.normalize(z_all)
+                start_states_norm = trainer.world.latent_rms.normalize(start_states)
+            else:
+                z_all_norm = z_all
+                start_states_norm = start_states
             
             act_emb_all = trainer.world.action(real_actions[:, ctx-1:].reshape(-1, A)).reshape(B_wm, T-ctx, -1)
             
             v_all_list = []
             for k in range(K):
-                t_k = torch.full((B_wm,), k * dt, device=z_all.device, dtype=z_all.dtype)
-                v = trainer.world.dynamics_flow.compute_velocity(z_all, t_k, start_states[:, :ctx], act_emb_all)
+                t_k = torch.full((B_wm,), k * dt, device=z_all_norm.device, dtype=z_all_norm.dtype)
+                if cfg_scale != 1.0:
+                    v_cond = trainer.world.dynamics_flow.compute_velocity(z_all_norm, t_k, start_states_norm[:, :ctx], act_emb_all, drop_ctx=False)
+                    v_uncond = trainer.world.dynamics_flow.compute_velocity(z_all_norm, t_k, start_states_norm[:, :ctx], act_emb_all, drop_ctx=True)
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                else:
+                    v = trainer.world.dynamics_flow.compute_velocity(z_all_norm, t_k, start_states_norm[:, :ctx], act_emb_all)
                 v_all_list.append(v)
-                z_all = z_all + dt * v
+                z_all_norm = z_all_norm + dt * v
+
+            if std_l:
+                z_all = trainer.world.latent_rms.denormalize(z_all_norm)
+                std_tensor = torch.sqrt(trainer.world.latent_rms.var + trainer.world.latent_rms.epsilon)
+                v_all_list = [v_step * std_tensor for v_step in v_all_list]
+            else:
+                z_all = z_all_norm
 
             dist_to_target = (z_all - z_1_all).pow(2).sum(dim=-1).sqrt().mean().item()
             v_target = z_1_all - z_0_all

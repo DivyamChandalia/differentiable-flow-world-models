@@ -129,6 +129,10 @@ class FlowMatchingDynamics(nn.Module):
         self.ctx_cond_token = nn.Parameter(torch.zeros(1, 1, action_dim))
         nn.init.normal_(self.ctx_cond_token, std=0.02)
 
+        # Learnable null context token for Classifier-Free Guidance (CFG)
+        self.null_ctx_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        nn.init.normal_(self.null_ctx_token, std=0.02)
+
         # ── Velocity network backbone (additive conditioning) ──────────
         self.velocity_net = ConditionalTransformer(
             depth=num_layers,
@@ -157,7 +161,7 @@ class FlowMatchingDynamics(nn.Module):
     # Core helpers
     # ------------------------------------------------------------------
 
-    def compute_velocity(self, z_t, t, ctx_states, future_action_emb):
+    def compute_velocity(self, z_t, t, ctx_states, future_action_emb, drop_ctx=None):
         """Evaluate the velocity field v_θ(z_t, t | ctx, actions).
 
         Args:
@@ -168,12 +172,25 @@ class FlowMatchingDynamics(nn.Module):
             ctx_states:        (B, C, D)           real context frames (clean)
             future_action_emb: (B, H, action_dim)  action embeddings for
                                predicted future steps
+            drop_ctx:          None, bool, or Tensor of shape (B,) indicating which
+                               samples in the batch have dropped context.
 
         Returns:
             velocity:          (B, H, D)  predicted velocity at positions of z_t
         """
         B, H, D = z_t.shape
         C = ctx_states.size(1)
+
+        # Apply context dropout / null token replacement for CFG
+        if drop_ctx is not None:
+            null_ctx = self.null_ctx_token.expand(B, C, -1)
+            if isinstance(drop_ctx, bool):
+                if drop_ctx:
+                    ctx_states = null_ctx
+            else:
+                # drop_ctx is a boolean tensor of shape (B,)
+                mask = drop_ctx.view(B, 1, 1)
+                ctx_states = torch.where(mask, null_ctx, ctx_states)
 
         # ── Per-position time embedding ─────────────────────────────────
         # Handle both (B,) shared time and (B, H) per-position time.
@@ -218,7 +235,7 @@ class FlowMatchingDynamics(nn.Module):
     # Training forward pass
     # ------------------------------------------------------------------
 
-    def forward(self, ctx_states, future_action_emb, target_states, source_states):
+    def forward(self, ctx_states, future_action_emb, target_states, source_states, cfg_dropout=0.0):
         """Training mode: compute velocity matching loss.
 
         State-to-state flow matching: interpolates between source_states
@@ -230,6 +247,7 @@ class FlowMatchingDynamics(nn.Module):
             future_action_emb: (B, H, action_dim) action embeddings for future steps
             target_states:     (B, H, D)          ground-truth next states
             source_states:     (B, H, D)          source states (last ctx broadcast)
+            cfg_dropout:       float              probability of dropping context for CFG
 
         Returns:
             velocity_loss: scalar  MSE velocity matching loss
@@ -255,8 +273,14 @@ class FlowMatchingDynamics(nn.Module):
         # Target velocity adapts to the noisy source: v* = z_1 - z_0
         velocity_target = target_states - z_0
 
-        # Predicted velocity (per-position t passed through)
-        velocity_pred = self.compute_velocity(z_t, t, ctx_states, future_action_emb)
+        # Sample per-sample context dropout mask for CFG training
+        if cfg_dropout > 0.0:
+            drop_ctx = torch.rand(B, device=ctx_states.device) < cfg_dropout
+        else:
+            drop_ctx = None
+
+        # Predicted velocity (per-position t passed through, with CFG context dropout)
+        velocity_pred = self.compute_velocity(z_t, t, ctx_states, future_action_emb, drop_ctx=drop_ctx)
 
         # Velocity matching loss
         velocity_loss = torch.nn.functional.mse_loss(velocity_pred, velocity_target)
@@ -267,7 +291,7 @@ class FlowMatchingDynamics(nn.Module):
     # Inference / Imagination
     # ------------------------------------------------------------------
 
-    def generate(self, ctx_states, future_action_emb, num_steps=None, source=None):
+    def generate(self, ctx_states, future_action_emb, num_steps=None, source=None, cfg_scale=1.0):
         """Euler integration from t=0 (source state) to t=1 (predicted states).
 
         Fully differentiable — gradients flow through all Euler steps.
@@ -279,17 +303,18 @@ class FlowMatchingDynamics(nn.Module):
             future_action_emb: (B, H, action_dim) action embeddings for future steps
             num_steps:         int, optional       override default Euler steps
             source:            (B, H, D), optional explicit source tensor
+            cfg_scale:         float, optional     CFG scale (1.0 means no CFG)
 
         Returns:
             pred_states: (B, H, D)  generated future latent states
         """
-        return self._euler_solve(ctx_states, future_action_emb, num_steps=num_steps, source=source)
+        return self._euler_solve(ctx_states, future_action_emb, num_steps=num_steps, source=source, cfg_scale=cfg_scale)
 
     # ------------------------------------------------------------------
     # Internal Euler solver
     # ------------------------------------------------------------------
 
-    def _euler_solve(self, ctx_states, future_action_emb, num_steps=None, source=None):
+    def _euler_solve(self, ctx_states, future_action_emb, num_steps=None, source=None, cfg_scale=1.0):
         """Run K-step Euler integration of the learned velocity field.
 
         z_{k+1} = z_k + dt * v_θ(z_k, t_k, ctx, actions)
@@ -302,6 +327,7 @@ class FlowMatchingDynamics(nn.Module):
             future_action_emb: (B, H, action_dim)
             num_steps:         int
             source:            (B, H, D), optional explicit source tensor
+            cfg_scale:         float              CFG extrapolation scale
 
         Returns:
             z: (B, H, D) — predicted states at t=1
@@ -325,7 +351,12 @@ class FlowMatchingDynamics(nn.Module):
                 (z.size(0),), k * dt,
                 device=z.device, dtype=z.dtype,
             )
-            v = self.compute_velocity(z, t_k, ctx_states, future_action_emb)
+            if cfg_scale != 1.0:
+                v_cond = self.compute_velocity(z, t_k, ctx_states, future_action_emb, drop_ctx=False)
+                v_uncond = self.compute_velocity(z, t_k, ctx_states, future_action_emb, drop_ctx=True)
+                v = v_uncond + cfg_scale * (v_cond - v_uncond)
+            else:
+                v = self.compute_velocity(z, t_k, ctx_states, future_action_emb)
             z = z + dt * v
 
         return z

@@ -1,6 +1,48 @@
 import torch
 import torch.nn as nn
 
+class RunningMeanStd(nn.Module):
+    def __init__(self, dim, epsilon=1e-5):
+        super().__init__()
+        self.register_buffer('mean', torch.zeros(dim))
+        self.register_buffer('var', torch.ones(dim))
+        self.register_buffer('count', torch.zeros(1))
+        self.epsilon = epsilon
+
+    @torch.no_grad()
+    def update(self, x):
+        x_flat = x.detach().reshape(-1, x.size(-1))
+        batch_mean = x_flat.mean(dim=0)
+        batch_var = x_flat.var(dim=0, unbiased=False)
+        batch_count = x_flat.size(0)
+
+        if self.count.item() == 0:
+            self.mean.copy_(batch_mean)
+            self.var.copy_(batch_var)
+            self.count.fill_(batch_count)
+        else:
+            delta = batch_mean - self.mean
+            tot_count = self.count + batch_count
+
+            new_mean = self.mean + delta * batch_count / tot_count
+            m_a = self.var * self.count
+            m_b = batch_var * batch_count
+            M2 = m_a + m_b + delta.square() * self.count * batch_count / tot_count
+            new_var = M2 / tot_count
+
+            self.mean.copy_(new_mean)
+            self.var.copy_(new_var)
+            self.count.copy_(tot_count)
+
+    def normalize(self, x):
+        std = torch.sqrt(self.var + self.epsilon)
+        return (x - self.mean) / std
+
+    def denormalize(self, x):
+        std = torch.sqrt(self.var + self.epsilon)
+        return x * std + self.mean
+
+
 class World(nn.Module):
     def __init__(self, vision, dynamics_ar, dynamics_flow, action, reward, termination, horizon=15, decoder=None):
         """Dual-dynamics world model.
@@ -25,12 +67,17 @@ class World(nn.Module):
         self.decoder = decoder
         self.horizon = horizon
 
+        # Latent standardization tracker for flow matching
+        self.latent_rms = RunningMeanStd(dim=vision.latent_dim if hasattr(vision, 'latent_dim') else 256)
+
         # KV cache for autoregressive step_world
         self.current_kv_cache = None
         self.latest_state = None
 
     def forward(self, actions, observations, ctx_frames=None, run_euler=False,
-                flow_detach_encoder=True, flow_distill_from_ar=False):
+                flow_detach_encoder=True, flow_distill_from_ar=False,
+                flow_standardize_latents=True, flow_cfg_dropout=0.0,
+                flow_cfg_scale=1.0):
         '''
         Training forward pass with dual dynamics.
 
@@ -52,6 +99,7 @@ class World(nn.Module):
             flow_detach_encoder: bool — if True, stop-grad encoder outputs for flow model
             flow_distill_from_ar: bool — if True, flow model trains on AR predictions
                                          instead of encoder outputs
+            flow_standardize_latents: bool — if True, standardize latents for flow matching
 
         Returns:
             states:            (B, T, D)     all encoded states
@@ -72,6 +120,10 @@ class World(nn.Module):
         states = states.reshape(B, T_obs, -1)
         current_states = states[:, :-1]   # (B, T-1, D) = (B, T_act, D)
         target_state = states[:, 1:]      # (B, T-1, D) = (B, T_act, D)
+
+        # Update latent running statistics for flow matching
+        if self.training:
+            self.latent_rms.update(states)
 
         # =====================================================================
         # Autoregressive dynamics — teacher-forced training
@@ -109,9 +161,19 @@ class World(nn.Module):
 
         flow_source = flow_ctx_states[:, -1:].expand_as(flow_future_targets)
 
-        velocity_loss = self.dynamics_flow(
-            flow_ctx_states, flow_future_act, flow_future_targets, flow_source
-        )
+        if flow_standardize_latents:
+            flow_ctx_states_norm = self.latent_rms.normalize(flow_ctx_states)
+            flow_future_targets_norm = self.latent_rms.normalize(flow_future_targets)
+            flow_source_norm = self.latent_rms.normalize(flow_source)
+            velocity_loss = self.dynamics_flow(
+                flow_ctx_states_norm, flow_future_act, flow_future_targets_norm, flow_source_norm,
+                cfg_dropout=flow_cfg_dropout
+            )
+        else:
+            velocity_loss = self.dynamics_flow(
+                flow_ctx_states, flow_future_act, flow_future_targets, flow_source,
+                cfg_dropout=flow_cfg_dropout
+            )
 
         # =====================================================================
         # Euler solve for reconstruction visualization (optional, no grad)
@@ -121,9 +183,16 @@ class World(nn.Module):
             with torch.no_grad():
                 euler_ctx = current_states[:, :flow_ctx_frames].detach()
                 euler_act = action_embedding[:, flow_ctx_frames - 1:].detach()
-                euler_pred = self.dynamics_flow.generate(
-                    euler_ctx, euler_act
-                )  # (B, H, D)
+                if flow_standardize_latents:
+                    euler_ctx_norm = self.latent_rms.normalize(euler_ctx)
+                    euler_pred_norm = self.dynamics_flow.generate(
+                        euler_ctx_norm, euler_act, cfg_scale=flow_cfg_scale
+                    )  # (B, H, D)
+                    euler_pred = self.latent_rms.denormalize(euler_pred_norm)
+                else:
+                    euler_pred = self.dynamics_flow.generate(
+                        euler_ctx, euler_act, cfg_scale=flow_cfg_scale
+                    )  # (B, H, D)
                 # Pad to full T_act length for visualization / loss
                 if flow_ctx_frames > 1:
                     euler_full = torch.cat([current_states[:, 1:flow_ctx_frames], euler_pred], dim=1)
@@ -189,7 +258,7 @@ class World(nn.Module):
 
         return self.latest_state, reward, terminal
 
-    def generate_chunk(self, actions, start_states):
+    def generate_chunk(self, actions, start_states, flow_standardize_latents=True):
         '''
         Parallel chunk generation via flow matching Euler integration.
         Fully differentiable — gradients flow through all Euler steps.
@@ -197,6 +266,7 @@ class World(nn.Module):
 
         actions: (B, T_act, Action space) - where T_act = ctx - 1 + chunk_size
         start_states: (B, ctx, Latent)
+        flow_standardize_latents: bool — whether to standardize inputs to the flow model
         
         Returns:
             all_states_seq: (chunk_size + 1, B, D)  — includes start state
@@ -213,11 +283,20 @@ class World(nn.Module):
         future_action_emb = action_embedding[:, ctx - 1:]  # (B, chunk_size, act_dim)
         
         # Flow matching: generate chunk_size future states from context
-        imagined_states = self.dynamics_flow.generate(
-            ctx_states=start_states,
-            future_action_emb=future_action_emb,
-            num_steps=self.dynamics_flow.num_euler_steps,
-        )  # (B, chunk_size, D)
+        if flow_standardize_latents:
+            ctx_states_norm = self.latent_rms.normalize(start_states)
+            imagined_states_norm = self.dynamics_flow.generate(
+                ctx_states=ctx_states_norm,
+                future_action_emb=future_action_emb,
+                num_steps=self.dynamics_flow.num_euler_steps,
+            )  # (B, chunk_size, D)
+            imagined_states = self.latent_rms.denormalize(imagined_states_norm)
+        else:
+            imagined_states = self.dynamics_flow.generate(
+                ctx_states=start_states,
+                future_action_emb=future_action_emb,
+                num_steps=self.dynamics_flow.num_euler_steps,
+            )  # (B, chunk_size, D)
         
         # Prepend the starting state to get chunk_size + 1 states
         all_states = torch.cat([start_states[:, -1:], imagined_states], dim=1)  # (B, chunk_size + 1, D)
