@@ -51,7 +51,10 @@ class Config:
     flow_cfg_dropout: float = 0.15      # Probability of dropping context during flow training (CFG)
     flow_cfg_scale: float = 3.0         # CFG extrapolation scale during actor imagination
     flow_standardize_latents: bool = True # Standardize latents to standard normal for flow model
-    flow_adjoint_method: str = "none"   # Adjoint method ('none', 'custom', or 'torchdiffeq')
+    flow_adjoint_method: str = "none"   # Adjoint method ('none' or 'torchdiffeq')
+    flow_solver: str = "euler"          # Solver name ('euler', 'rk4', or 'dopri5')
+    flow_solver_rtol: float = 1e-5      # Relative tolerance for adaptive solvers (dopri5)
+    flow_solver_atol: float = 1e-7      # Absolute tolerance for adaptive solvers (dopri5)
     
     max_frames: int = 18
     world_horizon: int = 15
@@ -207,6 +210,9 @@ class Trainer:
             causal=cfg.flow_causal, num_euler_steps=cfg.flow_num_euler_steps,
             source_noise_sigma=cfg.flow_source_noise_sigma,
             adjoint_method=cfg.flow_adjoint_method,
+            solver=cfg.flow_solver,
+            rtol=cfg.flow_solver_rtol,
+            atol=cfg.flow_solver_atol,
         )
         reward_enc = Reward(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         termination_enc = Termination(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
