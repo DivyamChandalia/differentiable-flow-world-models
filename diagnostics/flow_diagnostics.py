@@ -75,12 +75,12 @@ class FlowDiagnostics:
         with torch.amp.autocast(device_type=self.device.type, enabled=trainer.use_amp, dtype=trainer.amp_dtype):
             action_embedding = trainer.world.action(future_actions.reshape(-1, AS)).reshape(num_viz, H, -1)
 
-            K = trainer.world.dynamics.num_euler_steps
+            K = trainer.world.dynamics_flow.num_euler_steps
             dt = 1.0 / K
 
             # Start integration at t=0 — add source noise to match inference
             z = ctx_windows[:, -1:].expand(-1, H, -1).clone()
-            sigma = trainer.world.dynamics.source_noise_sigma
+            sigma = trainer.world.dynamics_flow.source_noise_sigma
             if sigma > 0:
                 z = z + sigma * torch.randn_like(z)
 
@@ -89,7 +89,7 @@ class FlowDiagnostics:
 
             for k in range(K):
                 t_k = torch.full((z.size(0),), k * dt, device=z.device, dtype=z.dtype)
-                v = trainer.world.dynamics.compute_velocity(z, t_k, ctx_windows, action_embedding)
+                v = trainer.world.dynamics_flow.compute_velocity(z, t_k, ctx_windows, action_embedding)
                 velocities.append(v)
                 z = z + dt * v
                 trajectory.append(z.clone())
@@ -142,7 +142,7 @@ class FlowDiagnostics:
             
             z_all = z_0_all.clone()
             # Add source noise to match inference
-            sigma = trainer.world.dynamics.source_noise_sigma
+            sigma = trainer.world.dynamics_flow.source_noise_sigma
             if sigma > 0:
                 z_all = z_all + sigma * torch.randn_like(z_all)
             
@@ -151,7 +151,7 @@ class FlowDiagnostics:
             v_all_list = []
             for k in range(K):
                 t_k = torch.full((B_wm,), k * dt, device=z_all.device, dtype=z_all.dtype)
-                v = trainer.world.dynamics.compute_velocity(z_all, t_k, start_states[:, :ctx], act_emb_all)
+                v = trainer.world.dynamics_flow.compute_velocity(z_all, t_k, start_states[:, :ctx], act_emb_all)
                 v_all_list.append(v)
                 z_all = z_all + dt * v
 

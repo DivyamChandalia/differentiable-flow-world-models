@@ -2,33 +2,65 @@ import torch
 import torch.nn as nn
 
 class World(nn.Module):
-    def __init__(self, vision, dynamics, action, reward, termination, horizon=15, decoder=None):
+    def __init__(self, vision, dynamics_ar, dynamics_flow, action, reward, termination, horizon=15, decoder=None):
+        """Dual-dynamics world model.
+
+        Args:
+            vision:        VisionEncoder — image → latent
+            dynamics_ar:   Dynamics (autoregressive) — trains encoder, reward, termination
+            dynamics_flow: FlowMatchingDynamics — fast parallel imagination for actor
+            action:        ActionEncoder — raw action → latent
+            reward:        Reward head
+            termination:   Termination head
+            horizon:       max sequence length for KV cache sliding window
+            decoder:       optional VisionDecoder for reconstruction debugging
+        """
         super().__init__()
         self.vision = vision
-        self.dynamics = dynamics
+        self.dynamics_ar = dynamics_ar
+        self.dynamics_flow = dynamics_flow
         self.action = action
         self.reward = reward
         self.termination = termination
         self.decoder = decoder
-        self.latest_state = None
         self.horizon = horizon
 
-    def forward(self, actions, observations, ctx_frames=None, run_euler=False):
-        '''
-        Training forward pass with flow matching dynamics.
+        # KV cache for autoregressive step_world
+        self.current_kv_cache = None
+        self.latest_state = None
 
-        action: (B, T-1, Action space)
-        observations: (B, T, C, H, W)
-        ctx_frames: int — number of real frames used as context
-        run_euler: bool — whether to compute Euler predicted next states (slow, for debugging/logging)
+    def forward(self, actions, observations, ctx_frames=None, run_euler=False,
+                flow_detach_encoder=True, flow_distill_from_ar=False):
+        '''
+        Training forward pass with dual dynamics.
+
+        Autoregressive dynamics (dynamics_ar):
+            - Predicts next states from context + placeholders (parallel)
+            - Trains encoder, reward, termination via gradient flow
+            - Returns pred_next_state for MSE dynamics loss
+
+        Flow matching dynamics (dynamics_flow):
+            - Learns velocity field for fast parallel imagination
+            - Optionally detached from encoder to prevent collapse
+            - Returns velocity_loss
+
+        Args:
+            actions:             (B, T-1, Action space)
+            observations:        (B, T, C, H, W)
+            ctx_frames:          int — number of real frames used as context
+            run_euler:           bool — compute Euler predicted states for visualization
+            flow_detach_encoder: bool — if True, stop-grad encoder outputs for flow model
+            flow_distill_from_ar: bool — if True, flow model trains on AR predictions
+                                         instead of encoder outputs
 
         Returns:
-            states:        (B, T, D)     all encoded states
-            target_state:  (B, T-1, D)   ground-truth next states (encoder outputs)
-            euler_full:    (B, T-1, D)   Euler-predicted states (or None if run_euler=False)
-            rewards:       (B, T-1, 1)   predicted rewards (from target states)
-            terminals:     (B, T-1, 1)   predicted terminals (from target states)
-            velocity_loss: scalar        CFM velocity matching loss
+            states:            (B, T, D)     all encoded states
+            target_state:      (B, T-1, D)   ground-truth next states (encoder outputs)
+            pred_next_state:   (B, T-1, D)   autoregressive predicted states
+            pred_rewards:      (B, T-1, 1)   predicted rewards (from AR predictions)
+            pred_terminals:    (B, T-1, 1)   predicted terminals (from AR predictions)
+            velocity_loss:     scalar         CFM velocity matching loss
+            euler_full:        (B, T-1, D)   Euler-predicted states (or None)
         '''
 
         B, T_act, AS = actions.shape
@@ -41,58 +73,75 @@ class World(nn.Module):
         current_states = states[:, :-1]   # (B, T-1, D) = (B, T_act, D)
         target_state = states[:, 1:]      # (B, T-1, D) = (B, T_act, D)
 
-        # --- Flow matching dynamics ---
-        if ctx_frames is not None and ctx_frames < T_act:
-            ctx_states = current_states[:, :ctx_frames]            # (B, ctx, D)
-            future_targets = target_state[:, ctx_frames - 1:]      # (B, H, D)
-            future_action_emb = action_embedding[:, ctx_frames - 1:]  # (B, H, act_dim)
+        # =====================================================================
+        # Autoregressive dynamics — teacher-forced training
+        # With causal attention, position i sees states 0..i and predicts
+        # state i+1 via the residual: pred[i] = current_states[i] + transformer_out[i]
+        # No placeholders needed — the causal mask prevents future leakage.
+        # =====================================================================
+        pred_next_state = self.dynamics_ar(current_states, action_embedding)
+
+        # Reward/term heads train on autoregressive predictions — gradients
+        # flow through the dynamics model as per the user's request
+        pred_rewards = self.reward(pred_next_state)
+        pred_terminals = self.termination(pred_next_state)
+
+        # =====================================================================
+        # Flow matching dynamics — velocity loss for the imagination model
+        # =====================================================================
+        flow_ctx_frames = ctx_frames if (ctx_frames is not None and ctx_frames < T_act) else 1
+
+        if flow_distill_from_ar:
+            # Train flow model to match AR predictions (distillation)
+            flow_future_targets = pred_next_state[:, flow_ctx_frames - 1:].detach()
         else:
-            ctx_frames = 1
-            ctx_states = current_states[:, :1]
-            future_targets = target_state
-            future_action_emb = action_embedding
+            # Train flow model on encoder outputs
+            flow_future_targets = target_state[:, flow_ctx_frames - 1:]
 
-        # Source for state-to-state flow matching: last context state,
-        # broadcast across the future prediction horizon
-        source_states = ctx_states[:, -1:].expand_as(future_targets)
+        flow_ctx_states = current_states[:, :flow_ctx_frames]
+        flow_future_act = action_embedding[:, flow_ctx_frames - 1:]
 
-        # Velocity matching loss (trains the velocity network).
-        # No detach — flow matching gradients flow into the vision encoder,
-        # encouraging dynamics-aware representations.
-        velocity_loss = self.dynamics(
-            ctx_states, future_action_emb, future_targets, source_states
+        if flow_detach_encoder:
+            # Stop-grad: flow model doesn't influence encoder learning
+            flow_ctx_states = flow_ctx_states.detach()
+            flow_future_targets = flow_future_targets.detach()
+            flow_future_act = flow_future_act.detach()
+
+        flow_source = flow_ctx_states[:, -1:].expand_as(flow_future_targets)
+
+        velocity_loss = self.dynamics_flow(
+            flow_ctx_states, flow_future_act, flow_future_targets, flow_source
         )
 
-        # Reward/term heads train on TARGET states (encoder outputs) — always
-        # meaningful representations, unlike Euler-predicted states which are
-        # garbage early in training.
-        rewards = self.reward(target_state)
-        terminals = self.termination(target_state)
-
-        # Euler solve for reconstruction visualization and loss (no grad needed)
+        # =====================================================================
+        # Euler solve for reconstruction visualization (optional, no grad)
+        # =====================================================================
         euler_full = None
         if run_euler:
             with torch.no_grad():
-                euler_pred = self.dynamics.generate(
-                    ctx_states, future_action_emb
+                euler_ctx = current_states[:, :flow_ctx_frames].detach()
+                euler_act = action_embedding[:, flow_ctx_frames - 1:].detach()
+                euler_pred = self.dynamics_flow.generate(
+                    euler_ctx, euler_act
                 )  # (B, H, D)
                 # Pad to full T_act length for visualization / loss
-                if ctx_frames > 1:
-                    euler_full = torch.cat([current_states[:, 1:ctx_frames], euler_pred], dim=1)
+                if flow_ctx_frames > 1:
+                    euler_full = torch.cat([current_states[:, 1:flow_ctx_frames], euler_pred], dim=1)
                 else:
                     euler_full = euler_pred
                 euler_full = euler_full[:, :T_act]
 
-        return states, target_state, euler_full, rewards, terminals, velocity_loss
-    
+        return states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss, euler_full
+
     def reset_cache(self):
-        """Kept for API compatibility. Flow matching is non-autoregressive."""
+        """Clears the KV cache before a new sequence rollout."""
+        self.current_kv_cache = None
         self.latest_state = None
 
     def step_world(self, actions, start_observations=None, start_states=None):
         '''
         Single-step world prediction for environment rollouts.
-        Uses flow matching generate() with a 1-step prediction horizon.
+        Uses autoregressive dynamics with KV cache for sequential inference.
 
         actions: (B, Seq, Action space)
         start_observations: (B, T, C, H, W) - For environment rollouts
@@ -100,28 +149,41 @@ class World(nn.Module):
         '''
         action_embedding = self.action(actions)
 
-        if self.latest_state is not None:
-            # Use latest_state as context (B, 1, D), predict one step forward
-            ctx = self.latest_state  # (B, 1, D)
-            future_act = action_embedding[:, -1:]  # (B, 1, act_dim)
-
-            pred = self.dynamics.generate(
-                ctx_states=ctx,
-                future_action_emb=future_act,
-                num_steps=self.dynamics.num_euler_steps,
-            )  # (B, 1, D)
-            self.latest_state = pred
-        else:
-            # First call: encode observations/states and store context
+        if self.current_kv_cache is None:
             if start_observations is not None:
                 B, T, C, H, W = start_observations.shape
                 state = self.vision(start_observations.reshape(B*T, C, H, W)).reshape(B, T, -1)
             elif start_states is not None:
                 state = start_states
             else:
-                raise ValueError("start_observations or start_states required for initial step")
-            self.latest_state = state[:, -1:]
+                raise ValueError("start_observations or start_states required for initial rollout")
             
+            if state.size(1) > self.horizon:
+                state = state[:, -self.horizon:]
+                action_embedding = action_embedding[:, -self.horizon:]
+
+            out_states, self.current_kv_cache = self.dynamics_ar(state, action_embedding, kv_cache=[])
+            self.latest_state = out_states[:, -1:]
+
+        else:
+            curr_action = action_embedding[:, -1:]
+
+            if self.current_kv_cache is not None:
+                # Sliding window: evict the oldest token if we are at the horizon limit.
+                cache_len = self.current_kv_cache[0][0].size(2)
+                if cache_len >= self.horizon:
+                    self.current_kv_cache = [
+                        (k[:, :, 1:, :], v[:, :, 1:, :])
+                        for k, v in self.current_kv_cache
+                    ]
+
+            out_states, self.current_kv_cache = self.dynamics_ar(
+                self.latest_state,
+                curr_action,
+                kv_cache=self.current_kv_cache
+            )
+            self.latest_state = out_states[:, -1:]
+
         reward = self.reward(self.latest_state.squeeze(1))
         terminal = self.termination(self.latest_state.squeeze(1))
 
@@ -131,6 +193,7 @@ class World(nn.Module):
         '''
         Parallel chunk generation via flow matching Euler integration.
         Fully differentiable — gradients flow through all Euler steps.
+        Used for actor imagination / training.
 
         actions: (B, T_act, Action space) - where T_act = ctx - 1 + chunk_size
         start_states: (B, ctx, Latent)
@@ -147,14 +210,13 @@ class World(nn.Module):
         chunk_size = T_act - ctx + 1
         
         # actions layout: [ctx-1 context transition actions | chunk_size future actions]
-        # The dynamics model only needs the future action embeddings
         future_action_emb = action_embedding[:, ctx - 1:]  # (B, chunk_size, act_dim)
         
         # Flow matching: generate chunk_size future states from context
-        imagined_states = self.dynamics.generate(
+        imagined_states = self.dynamics_flow.generate(
             ctx_states=start_states,
             future_action_emb=future_action_emb,
-            num_steps=self.dynamics.num_euler_steps,
+            num_steps=self.dynamics_flow.num_euler_steps,
         )  # (B, chunk_size, D)
         
         # Prepend the starting state to get chunk_size + 1 states
@@ -187,7 +249,7 @@ if __name__ == "__main__":
     import torch.nn.functional as F
     import torch.optim as optim
     from .world_helpers import VisionEncoder, ActionEncoder, Reward, Termination
-    from .dynamics import FlowMatchingDynamics
+    from .dynamics import Dynamics, FlowMatchingDynamics
     from .agent import Actor, Value
     from gymnasium import spaces
     import numpy as np
@@ -197,19 +259,30 @@ if __name__ == "__main__":
     horizon = 16
     batch_size = 4
     img_size = (64, 64)
+    ctx_frames = 3
     
     action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
     
     vision = VisionEncoder(latent_dim=latent_dim, hidden_dim=hidden_dim)
     action_encoder = ActionEncoder(action_space=action_space, hidden_dim=hidden_dim, output_dim=latent_dim)
-    dynamics = FlowMatchingDynamics(
-        max_frames=horizon + 10,
+    
+    dynamics_ar = Dynamics(
+        max_frames=horizon,
+        action_dim=latent_dim,
+        hidden_dim=latent_dim,
+        num_layers=6,
+        num_heads=4,
+        causal=False,  # Non-causal for parallel training
+    )
+    dynamics_flow = FlowMatchingDynamics(
+        max_frames=horizon + ctx_frames,
         action_dim=latent_dim,
         hidden_dim=latent_dim,
         num_layers=6,
         num_heads=4,
         num_euler_steps=6,
     )
+    
     reward = Reward(obs_dim=latent_dim, hidden_dim=hidden_dim)
     termination = Termination(obs_dim=latent_dim, hidden_dim=hidden_dim)
     value = Value(obs_dim=latent_dim, hidden_dim=hidden_dim)
@@ -217,22 +290,24 @@ if __name__ == "__main__":
 
     world = World(
         vision=vision,
-        dynamics=dynamics,
+        dynamics_ar=dynamics_ar,
+        dynamics_flow=dynamics_flow,
         action=action_encoder,
         reward=reward,
-        termination=termination
+        termination=termination,
     )
 
     world_params = (
         list(vision.parameters()) + 
         list(action_encoder.parameters()) + 
-        list(dynamics.parameters()) + 
+        list(dynamics_ar.parameters()) +
+        list(dynamics_flow.parameters()) +
         list(reward.parameters()) +
         list(termination.parameters())
     )
     world_optimizer = optim.Adam(world_params, lr=1e-4)
 
-    print("--- Training World Model (Batched) ---")
+    print("--- Training World Model (Dual Dynamics) ---")
     num_train_steps = 10
     
     for step in range(num_train_steps):
@@ -243,26 +318,27 @@ if __name__ == "__main__":
 
         world_optimizer.zero_grad()
         
-        states, target_latents, pred_latents, pred_rewards, pred_terminals, vel_loss = world(
-            batch_actions, batch_obs, ctx_frames=3
+        states, target_latents, pred_latents, pred_rewards, pred_terminals, vel_loss, _ = world(
+            batch_actions, batch_obs, ctx_frames=ctx_frames
         )
         
+        dyn_loss = F.mse_loss(pred_latents, target_latents.detach())
         reward_loss = F.mse_loss(pred_rewards, batch_rewards_gt)
         term_loss = F.binary_cross_entropy_with_logits(pred_terminals, batch_terminals_gt)
         
-        world_loss = vel_loss + reward_loss + term_loss
+        world_loss = dyn_loss + vel_loss + reward_loss + term_loss
         
         world_loss.backward()
         world_optimizer.step()
         
         if step % 2 == 0:
             print(f"Step {step} | Total Loss: {world_loss.item():.4f} "
-                  f"(Velocity: {vel_loss.item():.4f}, Reward: {reward_loss.item():.4f}, Term: {term_loss.item():.4f})")
+                  f"(AR Dyn: {dyn_loss.item():.4f}, Flow Vel: {vel_loss.item():.4f}, "
+                  f"Reward: {reward_loss.item():.4f}, Term: {term_loss.item():.4f})")
 
 
     print("\n--- Imagination Rollout (Flow Matching Chunk Generation) ---")
     imagination_horizon = 15
-    ctx_frames = 3
     
     world.freeze()
     

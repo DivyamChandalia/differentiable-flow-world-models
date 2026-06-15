@@ -12,7 +12,7 @@ from tqdm import tqdm
 from envs.helpers import make_env, SubprocVecEnv
 from losses import SIGReg, WeakSIGReg, ValueLoss, ActorLoss, ReturnEMA
 from models.agent import Actor, Value
-from models.dynamics import FlowMatchingDynamics
+from models.dynamics import Dynamics, FlowMatchingDynamics
 from models.world_helpers import VisionEncoder, ActionEncoder, Reward, VisionDecoder, Termination
 import torchvision
 from models.world import World
@@ -33,12 +33,21 @@ class Config:
     
     latent_dim: int = 256
     hidden_dim: int = 256
+    
+    # Autoregressive dynamics (for encoder/reward/termination training)
     dyn_num_layers: int = 6
     dyn_num_heads: int = 4
-    dyn_causal: bool = True
+    dyn_causal: bool = True  # Causal: teacher-forced AR, mask prevents seeing future states
+    
+    # Flow matching dynamics (for actor imagination)
+    flow_num_layers: int = 6
+    flow_num_heads: int = 4
+    flow_causal: bool = False  # Non-causal: all future positions generated in parallel
     flow_num_euler_steps: int = 6
-    flow_source_noise_sigma: float = 0.0
+    flow_source_noise_sigma: float = 1.0
     flow_loss_weight: float = 1.0
+    flow_detach_encoder: bool = True    # Stop-grad encoder outputs for flow model
+    flow_distill_from_ar: bool = False  # If True, flow trains on AR predictions instead of encoder outputs
     
     max_frames: int = 18
     world_horizon: int = 15
@@ -60,7 +69,7 @@ class Config:
     value_target_tau: float = 0.02
     
     use_sigreg: bool = True
-    sigreg_weight: float = 1
+    sigreg_weight: float = 0.1
     weak_sigreg: bool = True     # if True, use WeakSIGReg (Frobenius cov loss) instead of SIGReg
     entropy_scale: float = 3e-3
     use_return_ema: bool = True
@@ -181,11 +190,17 @@ class Trainer:
         
         vision = VisionEncoder(latent_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         action_enc = ActionEncoder(action_space=self.envs.get_action_space(), hidden_dim=cfg.hidden_dim, output_dim=cfg.latent_dim)
-        dynamics = FlowMatchingDynamics(
+        dynamics_ar = Dynamics(
             max_frames=cfg.max_frames + cfg.imagination_ctx_frames,
             action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim,
             num_layers=cfg.dyn_num_layers, num_heads=cfg.dyn_num_heads,
-            causal=cfg.dyn_causal, num_euler_steps=cfg.flow_num_euler_steps,
+            causal=cfg.dyn_causal,
+        )
+        dynamics_flow = FlowMatchingDynamics(
+            max_frames=cfg.max_frames + cfg.imagination_ctx_frames,
+            action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim,
+            num_layers=cfg.flow_num_layers, num_heads=cfg.flow_num_heads,
+            causal=cfg.flow_causal, num_euler_steps=cfg.flow_num_euler_steps,
             source_noise_sigma=cfg.flow_source_noise_sigma,
         )
         reward_enc = Reward(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
@@ -196,7 +211,7 @@ class Trainer:
         else:
             decoder = None
             
-        self.world = World(vision, dynamics, action_enc, reward_enc, termination_enc, self.cfg.world_horizon, decoder=decoder).to(self.device)
+        self.world = World(vision, dynamics_ar, dynamics_flow, action_enc, reward_enc, termination_enc, self.cfg.world_horizon, decoder=decoder).to(self.device)
         self.actor = Actor(action_space=self.envs.get_action_space(), obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim, chunk_size=cfg.world_horizon, num_blocks=cfg.actor_num_blocks).to(self.device)
         self.value_model = Value(obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
         self.target_value_model = Value(obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
@@ -471,8 +486,10 @@ class Trainer:
         log_recon = self.cfg.recon_debug and (self.world_step % self.cfg.train_steps == 0)
         
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-            raw_states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss = self.world(
-                act_batch, obs_batch, ctx_frames=self.cfg.imagination_ctx_frames, run_euler=log_recon
+            raw_states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss, euler_full = self.world(
+                act_batch, obs_batch, ctx_frames=self.cfg.imagination_ctx_frames, run_euler=log_recon,
+                flow_detach_encoder=self.cfg.flow_detach_encoder,
+                flow_distill_from_ar=self.cfg.flow_distill_from_ar,
             )
             
             recon_loss = None
@@ -493,8 +510,15 @@ class Trainer:
                         recon_pred_obs = self.world.decoder(pred_next_state.detach())
                     recon_pred_loss = F.mse_loss(recon_pred_obs.float(), obs_batch[:, 1:].float())
             
-        # Flow matching velocity loss replaces the old MSE dynamics loss
-        dyn_loss = self.cfg.flow_loss_weight * velocity_loss
+        # Autoregressive dynamics loss (MSE to detached encoder targets)
+        ar_dyn_loss = F.mse_loss(pred_next_state.float(), target_state.detach().float())
+        
+        # Flow matching velocity loss (separate, optionally detached from encoder)
+        flow_loss = self.cfg.flow_loss_weight * velocity_loss
+        
+        # Combined dynamics loss (AR + flow)
+        dyn_loss = ar_dyn_loss + flow_loss
+        
         rew_loss = F.mse_loss(pred_rewards.float(), sym_rew_batch[:, 1:].float())
         term_loss = F.binary_cross_entropy_with_logits(pred_terminals.float(), term_batch[:, 1:].float())
         
@@ -506,7 +530,7 @@ class Trainer:
         if self.cfg.recon_debug:
             wm_loss = dyn_loss + rew_loss + term_loss + total_recon_loss
         else:
-            wm_loss = dyn_loss + rew_loss + term_lossvisualise
+            wm_loss = dyn_loss + rew_loss + term_loss
             
         if self.cfg.use_sigreg:
             wm_loss = wm_loss + self.cfg.sigreg_weight * sig_loss
@@ -514,10 +538,15 @@ class Trainer:
         # Compute individual grad norms for world model losses
         scale_factor = self.scaler.get_scale()
         
-        # Dynamics Loss
+        # AR Dynamics Loss
         self.world_opt.zero_grad(set_to_none=True)
-        self.scaler.scale(dyn_loss).backward(retain_graph=True)
-        dyn_grad_norm = self._compute_grad_norm(self.world) / scale_factor
+        self.scaler.scale(ar_dyn_loss).backward(retain_graph=True)
+        ar_dyn_grad_norm = self._compute_grad_norm(self.world) / scale_factor
+        
+        # Flow Velocity Loss
+        self.world_opt.zero_grad(set_to_none=True)
+        self.scaler.scale(flow_loss).backward(retain_graph=True)
+        flow_grad_norm = self._compute_grad_norm(self.world) / scale_factor
         
         # Reward Loss
         self.world_opt.zero_grad(set_to_none=True)
@@ -556,12 +585,16 @@ class Trainer:
         self.scaler.update()
         
         self.writer.add_scalar('Loss/World_Total', wm_loss.item(), self.world_step)
+        self.writer.add_scalar('Loss/World_AR_Dynamics', ar_dyn_loss.item(), self.world_step)
+        self.writer.add_scalar('Loss/World_Flow_Velocity', flow_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Dynamics', dyn_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Reward', rew_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Termination', term_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_SIGReg', sig_loss.item(), self.world_step)
         self.writer.add_scalar('GradNorm/World_SIGReg', sig_grad_norm, self.world_step)
         self.writer.add_scalar('GradNorm/World_Termination', term_grad_norm, self.world_step)
+        self.writer.add_scalar('GradNorm/World_AR_Dynamics', ar_dyn_grad_norm, self.world_step)
+        self.writer.add_scalar('GradNorm/World_Flow_Velocity', flow_grad_norm, self.world_step)
         
         if self.cfg.recon_debug:
             self.writer.add_scalar('Loss/World_Reconstruction', recon_loss.item(), self.world_step)
@@ -570,7 +603,7 @@ class Trainer:
             self.writer.add_scalar('GradNorm/World_Reconstruction', recon_grad_norm, self.world_step)
             
         self.writer.add_scalar('GradNorm/World', grad_norm, self.world_step)
-        self.writer.add_scalar('GradNorm/World_Dynamics', dyn_grad_norm, self.world_step)
+        self.writer.add_scalar('GradNorm/World_Dynamics', ar_dyn_grad_norm, self.world_step)
         self.writer.add_scalar('GradNorm/World_Reward', rew_grad_norm, self.world_step)
         
         if self.cfg.recon_debug and (self.world_step % self.cfg.train_steps == 0):
@@ -590,45 +623,42 @@ class Trainer:
         actual = obs_batch[idx, ctx:].detach().cpu()
         encoded = recon_obs[0, ctx:].detach().cpu()
         
-        # 2. Perform a full rollout to predict next states
-        ctx_states = raw_states[idx:idx+1, :ctx] # (1, ctx, D)
-        
-        # Extract action sequence for this item
-        actions_idx = act_batch[idx:idx+1, ctx-1:] # (1, T-ctx, AS)
-        
-        # Embed actions
+        # 2. Autoregressive predictions (teacher-forced, causal masking)
+        ctx_states = raw_states[idx:idx+1, :ctx]  # (1, ctx, D)
+        actions_idx = act_batch[idx:idx+1, ctx-1:]  # (1, T-ctx, AS)
         AS = actions_idx.shape[-1]
         action_embedding = self.world.action(actions_idx.reshape(-1, AS)).reshape(1, actions_idx.size(1), -1)
         
-        # Euler solve
-        euler_pred = self.world.dynamics.generate(ctx_states, action_embedding) # (1, T-ctx, D)
+        # AR dynamics: feed all real states with causal masking (matches training forward)
+        T_act = act_batch.size(1)
+        current_states_idx = raw_states[idx:idx+1, :-1]  # (1, T_act, D) — all current states
+        all_action_emb = self.world.action(act_batch[idx:idx+1].reshape(-1, AS)).reshape(1, T_act, -1)
+        ar_pred = self.world.dynamics_ar(current_states_idx, all_action_emb)  # (1, T_act, D)
+        
+        # Decode AR predictions
+        recon_ar_pred_obs = self.world.decoder(ar_pred.detach())
+        ar_aligned = recon_ar_pred_obs[0, ctx-1:].detach().cpu()
+        
+        # 3. Flow matching Euler predictions
+        euler_pred = self.world.dynamics_flow.generate(ctx_states, action_embedding)  # (1, T-ctx, D)
         
         # Align/pad to match predicted next states format
         if ctx > 1:
-            pred_next_state = torch.cat([raw_states[idx:idx+1, 1:ctx], euler_pred], dim=1) # (1, T-1, D)
+            flow_pred_next_state = torch.cat([raw_states[idx:idx+1, 1:ctx], euler_pred], dim=1)
         else:
-            pred_next_state = euler_pred # (1, T-1, D)
+            flow_pred_next_state = euler_pred
             
-        # Decode predicted next states
-        recon_pred_obs = self.world.decoder(pred_next_state.detach()) # (1, T-1, C, H, W)
-        pred_aligned = recon_pred_obs[0, ctx-1:].detach().cpu()
+        recon_flow_pred_obs = self.world.decoder(flow_pred_next_state.detach())
+        flow_aligned = recon_flow_pred_obs[0, ctx-1:].detach().cpu()
 
-        # Calculate predicted values for encoded and predicted states
-        states_idx = raw_states[idx:idx+1].transpose(0, 1) # (T, 1, D)
-        enc_windows = self._get_history_windows(states_idx, self.cfg.agent_horizon, context=None) # (T, 1, agent_horizon * D)
+        # 4. Calculate predicted values for encoded and predicted states
+        states_idx = raw_states[idx:idx+1].transpose(0, 1)
+        enc_windows = self._get_history_windows(states_idx, self.cfg.agent_horizon, context=None)
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             enc_vals_raw = self.value_model(enc_windows)
             if self.cfg.use_symlog:
                 enc_vals_raw = symexp(enc_vals_raw)
-            enc_values = enc_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()[ctx:] # shape (T-ctx,)
-
-        pred_states_idx = torch.cat([raw_states[idx:idx+1, 0:1], pred_next_state], dim=1).transpose(0, 1) # (T, 1, D)
-        pred_windows = self._get_history_windows(pred_states_idx, self.cfg.agent_horizon, context=None) # (T, 1, agent_horizon * D)
-        with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-            pred_vals_raw = self.value_model(pred_windows)
-            if self.cfg.use_symlog:
-                pred_vals_raw = symexp(pred_vals_raw)
-            pred_values = pred_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()[ctx:] # shape (T-ctx,)
+            enc_values = enc_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()[ctx:]
 
         # Draw values on encoded frames
         encoded_with_val = []
@@ -645,62 +675,50 @@ class Trainer:
             encoded_with_val.append(to_tensor(img_pil))
         encoded_with_val = torch.stack(encoded_with_val, dim=0)
 
-        # Draw values on predicted frames
-        pred_aligned_with_val = []
-        for t in range(pred_aligned.size(0)):
-            val = pred_values[t]
-            frame = pred_aligned[t].float()
-            img_pil = to_pil_image(frame)
-            draw = ImageDraw.Draw(img_pil)
-            text = f"v:{val:.2f}"
-            mode_text = "GEN"
-            mode_color = "red"
-                
-            x, y = 2, 2
-            if text:
+        def annotate_frames(frames_cpu, mode_text, mode_color):
+            """Add mode label to bottom of each frame."""
+            annotated = []
+            for t in range(frames_cpu.size(0)):
+                frame = frames_cpu[t].float()
+                img_pil = to_pil_image(frame)
+                draw = ImageDraw.Draw(img_pil)
+                w, h = img_pil.size
+                x_m, y_m = 2, h - 12
                 for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
-                    draw.text((x + dx, y + dy), text, fill="black")
-                draw.text((x, y), text, fill="white")
-                
-            # Draw mode text at bottom
-            w, h = img_pil.size
-            x_m, y_m = 2, h - 12
-            for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
-                draw.text((x_m + dx, y_m + dy), mode_text, fill="black")
-            draw.text((x_m, y_m), mode_text, fill=mode_color)
-            
-            pred_aligned_with_val.append(to_tensor(img_pil))
-        pred_aligned_with_val = torch.stack(pred_aligned_with_val, dim=0)
+                    draw.text((x_m + dx, y_m + dy), mode_text, fill="black")
+                draw.text((x_m, y_m), mode_text, fill=mode_color)
+                annotated.append(to_tensor(img_pil))
+            return torch.stack(annotated, dim=0)
+        
+        ar_annotated = annotate_frames(ar_aligned, "AR", "cyan")
+        flow_annotated = annotate_frames(flow_aligned, "FLOW", "red")
         
         grid_actual = torchvision.utils.make_grid(actual, nrow=actual.size(0), normalize=False)
         grid_encoded = torchvision.utils.make_grid(encoded_with_val, nrow=encoded_with_val.size(0), normalize=False)
-        grid_pred = torchvision.utils.make_grid(pred_aligned_with_val, nrow=pred_aligned_with_val.size(0), normalize=False)
+        grid_ar = torchvision.utils.make_grid(ar_annotated, nrow=ar_annotated.size(0), normalize=False)
+        grid_flow = torchvision.utils.make_grid(flow_annotated, nrow=flow_annotated.size(0), normalize=False)
         
-        combined_grid = torch.cat([grid_actual, grid_encoded, grid_pred], dim=1)
-        self.writer.add_image('Reconstruction/Actual_vs_Encoded_vs_Predicted', combined_grid, self.world_step)
+        combined_grid = torch.cat([grid_actual, grid_encoded, grid_ar, grid_flow], dim=1)
+        self.writer.add_image('Reconstruction/Actual_vs_Encoded_vs_AR_vs_Flow', combined_grid, self.world_step)
         
         # --- Velocity field diagnostics ---
-        # Uses the same ctx_states / action_embedding already computed above
-        # Compute future targets: encoded states after context, matching world.forward slicing
-        target_states_all = raw_states[idx:idx+1, 1:]  # (1, T-1, D)
-        future_targets = target_states_all[:, ctx-1:]    # (1, H, D)
-        source = ctx_states[:, -1:].expand_as(euler_pred)  # (1, H, D)
-        v_gt = future_targets - source  # ground truth velocity
+        target_states_all = raw_states[idx:idx+1, 1:]
+        future_targets = target_states_all[:, ctx-1:]
+        source = ctx_states[:, -1:].expand_as(euler_pred)
+        v_gt = future_targets - source
         
-        # Check: does predicted velocity vary with t? (shouldn't for OT-CFM)
-        v_at_0 = self.world.dynamics.compute_velocity(
+        v_at_0 = self.world.dynamics_flow.compute_velocity(
             source.clone(), torch.zeros(1, device=source.device), ctx_states, action_embedding
         )
-        v_at_05 = self.world.dynamics.compute_velocity(
+        v_at_05 = self.world.dynamics_flow.compute_velocity(
             0.5 * source + 0.5 * future_targets,
             torch.full((1,), 0.5, device=source.device), ctx_states, action_embedding
         )
-        v_at_09 = self.world.dynamics.compute_velocity(
+        v_at_09 = self.world.dynamics_flow.compute_velocity(
             0.1 * source + 0.9 * future_targets,
             torch.full((1,), 0.9, device=source.device), ctx_states, action_embedding
         )
         
-        # MSE of velocity prediction at different t values
         mse_t0 = (v_at_0 - v_gt).pow(2).mean().item()
         mse_t05 = (v_at_05 - v_gt).pow(2).mean().item()
         mse_t09 = (v_at_09 - v_gt).pow(2).mean().item()
@@ -708,19 +726,16 @@ class Trainer:
         self.writer.add_scalar('Diag/Velocity_MSE_t05', mse_t05, self.world_step)
         self.writer.add_scalar('Diag/Velocity_MSE_t09', mse_t09, self.world_step)
         
-        # Cosine similarity at t=0 (inference regime)
         cos_t0 = torch.nn.functional.cosine_similarity(
             v_at_0.reshape(1, -1), v_gt.reshape(1, -1), dim=1
         ).item()
         self.writer.add_scalar('Diag/Velocity_Cosine_t0', cos_t0, self.world_step)
         
-        # Per-position diversity of Euler output
         euler_pos_var = euler_pred.var(dim=1).mean().item()
         target_pos_var = future_targets.var(dim=1).mean().item()
         self.writer.add_scalar('Diag/Euler_PositionVariance', euler_pos_var, self.world_step)
         self.writer.add_scalar('Diag/Target_PositionVariance', target_pos_var, self.world_step)
         
-        # Euler MSE to target
         euler_mse = (euler_pred - future_targets).pow(2).mean().item()
         self.writer.add_scalar('Diag/Euler_MSE_to_Target', euler_mse, self.world_step)
 

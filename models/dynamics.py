@@ -3,6 +3,56 @@ import torch.nn as nn
 from .common import ConditionalTransformer, SinusoidalTimeEmbedding
 
 
+class Dynamics(nn.Module):
+    """Autoregressive dynamics model (AdaLN Transformer with residual).
+
+    Takes encoded states + action embeddings, processes through a conditional
+    transformer, and adds a residual connection.  Supports KV-cache for
+    step-by-step inference during environment rollouts.
+
+    Training mode (parallel):
+        pred_states = model(x_input, action_embedding)
+        loss = MSE(pred_states, target_states.detach())
+
+    Inference mode (autoregressive with KV cache):
+        pred, kv = model(state, action, kv_cache=prev_kv)
+    """
+
+    def __init__(
+        self,
+        max_frames,
+        action_dim,
+        hidden_dim,
+        num_layers,
+        num_heads,
+        dropout=0.0,
+        causal=True,
+    ):
+        super().__init__()
+        self.transformer = ConditionalTransformer(
+            depth=num_layers,
+            dim=hidden_dim,
+            num_heads=num_heads,
+            cond_dim=action_dim,
+            seq_len=max_frames,
+            causal=causal,
+        )
+        self.horizon = max_frames
+
+    def forward(self, x, c, kv_cache=None):
+        """
+        x: (B, T, d)   — input states (real context + placeholders)
+        c: (B, T, act_dim) — action embeddings
+        kv_cache: optional list of (K, V) tuples per layer
+        """
+        res = self.transformer(x, c, kv_cache=kv_cache)
+        if kv_cache is not None:
+            out, new_kv_cache = res
+            return x + out, new_kv_cache
+        else:
+            return x + res
+
+
 class FlowMatchingDynamics(nn.Module):
     """State-to-State Conditional Flow Matching dynamics model.
 

@@ -183,15 +183,7 @@ class AdaLNTransformerBlock(nn.Module):
         )
 
         nn.init.zeros_(self.adaln_modulation[-1].weight)
-        # Initialize gate biases to small positive values so the network
-        # isn't a pure identity at init (critical for flow matching velocity).
-        # Bias layout: [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
-        bias = self.adaln_modulation[-1].bias
-        nn.init.zeros_(bias)
-        gate_dim = bias.shape[0] // 6
-        with torch.no_grad():
-            bias[2 * gate_dim : 3 * gate_dim] = 0.1   # gate_msa
-            bias[5 * gate_dim : 6 * gate_dim] = 0.1   # gate_mlp
+        nn.init.zeros_(self.adaln_modulation[-1].bias)
 
     def forward(self, x, c, freqs_cis, kv_cache=None):
         (shift_msa, scale_msa, gate_msa, 
