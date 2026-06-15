@@ -78,19 +78,20 @@ class FlowDiagnostics:
             K = trainer.world.dynamics_flow.num_euler_steps
             dt = 1.0 / K
 
-            # Start integration at t=0 — add source noise to match inference
-            z = ctx_windows[:, -1:].expand(-1, H, -1).clone()
-            sigma = trainer.world.dynamics_flow.source_noise_sigma
-            if sigma > 0:
-                z = z + sigma * torch.randn_like(z)
-
-            # Normalize if needed
+            # Normalize context/targets if needed
             std_l = cfg.flow_standardize_latents
             if std_l:
                 ctx_windows_norm = trainer.world.latent_rms.normalize(ctx_windows)
-                z = trainer.world.latent_rms.normalize(z)
+                future_targets_norm = trainer.world.latent_rms.normalize(future_targets)
             else:
                 ctx_windows_norm = ctx_windows
+                future_targets_norm = future_targets
+
+            # Start integration at t=0 — in normalized or unnormalized space depending on std_l
+            z = ctx_windows_norm[:, -1:].expand(-1, H, -1).clone()
+            sigma = trainer.world.dynamics_flow.source_noise_sigma
+            if sigma > 0:
+                z = z + sigma * torch.randn_like(z)
 
             trajectory = [z.clone()]
             velocities = []
@@ -108,16 +109,10 @@ class FlowDiagnostics:
                 z = z + dt * v
                 trajectory.append(z.clone())
 
-            # Denormalize trajectories and velocities
-            if std_l:
-                trajectory = [trainer.world.latent_rms.denormalize(t_step) for t_step in trajectory]
-                std_tensor = torch.sqrt(trainer.world.latent_rms.var + trainer.world.latent_rms.epsilon)
-                velocities = [v_step * std_tensor for v_step in velocities]
-
         # Optimal Transport (OT) linear interpolation for comparison
         # Uses the same noisy source as the integration for fair comparison
         z_0 = trajectory[0]  # already has noise applied
-        z_1 = future_targets
+        z_1 = future_targets_norm
         ot_trajectory = []
         for k in range(K + 1):
             t_val = k * dt
@@ -128,8 +123,8 @@ class FlowDiagnostics:
         sequences = []
         for i in range(num_viz):
             pts = [
-                ctx_windows[i],
-                future_targets[i]
+                ctx_windows_norm[i],
+                future_targets_norm[i]
             ]
             for traj in trajectory:
                 pts.append(traj[i])
@@ -140,8 +135,8 @@ class FlowDiagnostics:
             mean, V = self.fit_pca(pts_tensor, q=2)
 
             # Project coordinates and velocities
-            ctx_proj = (ctx_windows[i].float() - mean) @ V
-            target_proj = (future_targets[i].float() - mean) @ V
+            ctx_proj = (ctx_windows_norm[i].float() - mean) @ V
+            target_proj = (future_targets_norm[i].float() - mean) @ V
             
             traj_proj = torch.stack([(t[i].float() - mean) @ V for t in trajectory], dim=0)
             ot_proj = torch.stack([(t[i].float() - mean) @ V for t in ot_trajectory], dim=0)
@@ -160,18 +155,19 @@ class FlowDiagnostics:
             z_0_all = start_states[:, ctx-1:ctx].expand(-1, T-ctx, -1)
             z_1_all = start_states[:, ctx:]
             
-            z_all = z_0_all.clone()
+            if std_l:
+                z_all_norm = trainer.world.latent_rms.normalize(z_0_all.clone())
+                start_states_norm = trainer.world.latent_rms.normalize(start_states)
+                z_1_all_norm = trainer.world.latent_rms.normalize(z_1_all)
+            else:
+                z_all_norm = z_0_all.clone()
+                start_states_norm = start_states
+                z_1_all_norm = z_1_all
+
             # Add source noise to match inference
             sigma = trainer.world.dynamics_flow.source_noise_sigma
             if sigma > 0:
-                z_all = z_all + sigma * torch.randn_like(z_all)
-
-            if std_l:
-                z_all_norm = trainer.world.latent_rms.normalize(z_all)
-                start_states_norm = trainer.world.latent_rms.normalize(start_states)
-            else:
-                z_all_norm = z_all
-                start_states_norm = start_states
+                z_all_norm = z_all_norm + sigma * torch.randn_like(z_all_norm)
             
             act_emb_all = trainer.world.action(real_actions[:, ctx-1:].reshape(-1, A)).reshape(B_wm, T-ctx, -1)
             
@@ -187,17 +183,10 @@ class FlowDiagnostics:
                 v_all_list.append(v)
                 z_all_norm = z_all_norm + dt * v
 
-            if std_l:
-                z_all = trainer.world.latent_rms.denormalize(z_all_norm)
-                std_tensor = torch.sqrt(trainer.world.latent_rms.var + trainer.world.latent_rms.epsilon)
-                v_all_list = [v_step * std_tensor for v_step in v_all_list]
-            else:
-                z_all = z_all_norm
-
-            dist_to_target = (z_all - z_1_all).pow(2).sum(dim=-1).sqrt().mean().item()
-            v_target = z_1_all - z_0_all
+            dist_to_target = (z_all_norm - z_1_all_norm).pow(2).sum(dim=-1).sqrt().mean().item()
+            v_target_norm = z_1_all_norm - (trainer.world.latent_rms.normalize(z_0_all) if std_l else z_0_all)
             v_pred_t0 = v_all_list[0]
-            cos_sim = torch.nn.functional.cosine_similarity(v_pred_t0, v_target, dim=-1).mean().item()
+            cos_sim = torch.nn.functional.cosine_similarity(v_pred_t0, v_target_norm, dim=-1).mean().item()
 
         return {
             'sequences': sequences,

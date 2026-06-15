@@ -44,7 +44,7 @@ class Config:
     flow_num_heads: int = 4
     flow_causal: bool = False  # Non-causal: all future positions generated in parallel
     flow_num_euler_steps: int = 6
-    flow_source_noise_sigma: float = 1.0
+    flow_source_noise_sigma: float = 0.05
     flow_loss_weight: float = 1.0
     flow_detach_encoder: bool = True    # Stop-grad encoder outputs for flow model
     flow_distill_from_ar: bool = False  # If True, flow trains on AR predictions instead of encoder outputs
