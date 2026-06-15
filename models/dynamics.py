@@ -2,6 +2,12 @@ import torch
 import torch.nn as nn
 from .common import ConditionalTransformer, SinusoidalTimeEmbedding
 
+try:
+    from torchdiffeq import odeint, odeint_adjoint
+    TORCHDIFFEQ_AVAILABLE = True
+except ImportError:
+    TORCHDIFFEQ_AVAILABLE = False
+
 
 class Dynamics(nn.Module):
     """Autoregressive dynamics model (AdaLN Transformer with residual).
@@ -53,6 +59,124 @@ class Dynamics(nn.Module):
             return x + res
 
 
+class EulerSolveAdjoint(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, dynamics_flow, z0, ctx_states, future_action_emb, num_steps, cfg_scale, *params):
+        ctx.dynamics_flow = dynamics_flow
+        ctx.num_steps = num_steps
+        ctx.cfg_scale = cfg_scale
+        
+        K = num_steps
+        dt = 1.0 / K
+        
+        z = z0.clone()
+        trajectory = [z.clone()]
+        
+        with torch.no_grad():
+            for k in range(K):
+                t_k = torch.full(
+                    (z.size(0),), k * dt,
+                    device=z.device, dtype=z.dtype,
+                )
+                if cfg_scale != 1.0:
+                    v_cond = dynamics_flow.compute_velocity(z, t_k, ctx_states, future_action_emb, drop_ctx=False)
+                    v_uncond = dynamics_flow.compute_velocity(z, t_k, ctx_states, future_action_emb, drop_ctx=True)
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                else:
+                    v = dynamics_flow.compute_velocity(z, t_k, ctx_states, future_action_emb)
+                z = z + dt * v
+                trajectory.append(z.clone())
+                
+        ctx.save_for_backward(ctx_states, future_action_emb, *trajectory)
+        return z
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        dynamics_flow = ctx.dynamics_flow
+        num_steps = ctx.num_steps
+        cfg_scale = ctx.cfg_scale
+        
+        saved_tensors = ctx.saved_tensors
+        ctx_states = saved_tensors[0]
+        future_action_emb = saved_tensors[1]
+        trajectory = saved_tensors[2:]
+        
+        K = num_steps
+        dt = 1.0 / K
+        
+        a = grad_output.clone()
+        
+        params = [p for p in dynamics_flow.parameters() if p.requires_grad]
+        grad_params = [torch.zeros_like(p) for p in params]
+        grad_ctx_states = torch.zeros_like(ctx_states)
+        grad_future_action_emb = torch.zeros_like(future_action_emb)
+        
+        for k in reversed(range(K)):
+            z_k = trajectory[k].detach().requires_grad_(True)
+            t_k = torch.full(
+                (z_k.size(0),), k * dt,
+                device=z_k.device, dtype=z_k.dtype,
+            )
+            
+            with torch.enable_grad():
+                if cfg_scale != 1.0:
+                    v_cond = dynamics_flow.compute_velocity(z_k, t_k, ctx_states, future_action_emb, drop_ctx=False)
+                    v_uncond = dynamics_flow.compute_velocity(z_k, t_k, ctx_states, future_action_emb, drop_ctx=True)
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                else:
+                    v = dynamics_flow.compute_velocity(z_k, t_k, ctx_states, future_action_emb)
+            
+            inputs = [z_k, ctx_states, future_action_emb] + params
+            grads = torch.autograd.grad(
+                v, inputs,
+                grad_outputs=a,
+                retain_graph=False,
+                allow_unused=True
+            )
+            
+            grad_zk_step = grads[0]
+            grad_ctx_states_step = grads[1]
+            grad_future_action_emb_step = grads[2]
+            grad_params_step = grads[3:]
+            
+            if grad_zk_step is not None:
+                a = a + dt * grad_zk_step
+            if grad_ctx_states_step is not None:
+                grad_ctx_states = grad_ctx_states + dt * grad_ctx_states_step
+            if grad_future_action_emb_step is not None:
+                grad_future_action_emb = grad_future_action_emb + dt * grad_future_action_emb_step
+                
+            for i, gp in enumerate(grad_params_step):
+                if gp is not None:
+                    grad_params[i] = grad_params[i] + dt * gp
+                    
+        return (None, a, grad_ctx_states, grad_future_action_emb, None, None) + tuple(grad_params)
+
+
+class ODEFuncWrapper(nn.Module):
+    def __init__(self, dynamics_flow, cfg_scale):
+        super().__init__()
+        self.dynamics_flow = dynamics_flow
+        self.cfg_scale = cfg_scale
+
+    def forward(self, t, state):
+        z, ctx_states, future_action_emb = state
+        t_expanded = t.expand(z.size(0))
+        if self.cfg_scale != 1.0:
+            v_cond = self.dynamics_flow.compute_velocity(
+                z, t_expanded, ctx_states, future_action_emb, drop_ctx=False
+            )
+            v_uncond = self.dynamics_flow.compute_velocity(
+                z, t_expanded, ctx_states, future_action_emb, drop_ctx=True
+            )
+            v = v_uncond + self.cfg_scale * (v_cond - v_uncond)
+        else:
+            v = self.dynamics_flow.compute_velocity(
+                z, t_expanded, ctx_states, future_action_emb
+            )
+        return (v, torch.zeros_like(ctx_states), torch.zeros_like(future_action_emb))
+
+
 class FlowMatchingDynamics(nn.Module):
     """State-to-State Conditional Flow Matching dynamics model.
 
@@ -89,12 +213,14 @@ class FlowMatchingDynamics(nn.Module):
         causal=False,
         num_euler_steps=6,
         source_noise_sigma=0.0,
+        adjoint_method='none',
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
         self.num_euler_steps = num_euler_steps
         self.source_noise_sigma = source_noise_sigma
+        self.adjoint_method = adjoint_method
         self.horizon = max_frames
 
         # ── Input projection ────────────────────────────────────────────
@@ -346,17 +472,34 @@ class FlowMatchingDynamics(nn.Module):
         # Warm-start noise — matches training distribution
         z = z + self.source_noise_sigma * torch.randn_like(z)
 
-        for k in range(K):
-            t_k = torch.full(
-                (z.size(0),), k * dt,
-                device=z.device, dtype=z.dtype,
+        if self.adjoint_method == 'custom':
+            params = [p for p in self.parameters() if p.requires_grad]
+            z = EulerSolveAdjoint.apply(self, z, ctx_states, future_action_emb, K, cfg_scale, *params)
+        elif self.adjoint_method == 'torchdiffeq':
+            if not TORCHDIFFEQ_AVAILABLE:
+                raise ImportError("torchdiffeq is not installed. Please choose 'custom' or 'none' for adjoint_method.")
+            func = ODEFuncWrapper(self, cfg_scale)
+            t_span = torch.tensor([0.0, 1.0], device=z.device, dtype=z.dtype)
+            out_tuple = odeint_adjoint(
+                func,
+                (z, ctx_states, future_action_emb),
+                t_span,
+                method='euler',
+                options={'step_size': dt}
             )
-            if cfg_scale != 1.0:
-                v_cond = self.compute_velocity(z, t_k, ctx_states, future_action_emb, drop_ctx=False)
-                v_uncond = self.compute_velocity(z, t_k, ctx_states, future_action_emb, drop_ctx=True)
-                v = v_uncond + cfg_scale * (v_cond - v_uncond)
-            else:
-                v = self.compute_velocity(z, t_k, ctx_states, future_action_emb)
-            z = z + dt * v
+            z = out_tuple[0][-1]
+        else:
+            for k in range(K):
+                t_k = torch.full(
+                    (z.size(0),), k * dt,
+                    device=z.device, dtype=z.dtype,
+                )
+                if cfg_scale != 1.0:
+                    v_cond = self.compute_velocity(z, t_k, ctx_states, future_action_emb, drop_ctx=False)
+                    v_uncond = self.compute_velocity(z, t_k, ctx_states, future_action_emb, drop_ctx=True)
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                else:
+                    v = self.compute_velocity(z, t_k, ctx_states, future_action_emb)
+                z = z + dt * v
 
         return z
