@@ -42,7 +42,7 @@ class Config:
     # Flow matching dynamics (for actor imagination)
     flow_num_layers: int = 6
     flow_num_heads: int = 4
-    flow_causal: bool = False  # Non-causal: all future positions generated in parallel
+    flow_causal: bool = True   # Causal sequence mask: prevents future target leakage during training
     flow_num_euler_steps: int = 6
     flow_source_noise_sigma: float = 0.05
     flow_loss_weight: float = 1.0
