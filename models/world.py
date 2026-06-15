@@ -258,7 +258,7 @@ class World(nn.Module):
 
         return self.latest_state, reward, terminal
 
-    def generate_chunk(self, actions, start_states, flow_standardize_latents=True):
+    def generate_chunk(self, actions, start_states, flow_standardize_latents=True, flow_cfg_scale=1.0):
         '''
         Parallel chunk generation via flow matching Euler integration.
         Fully differentiable — gradients flow through all Euler steps.
@@ -267,6 +267,7 @@ class World(nn.Module):
         actions: (B, T_act, Action space) - where T_act = ctx - 1 + chunk_size
         start_states: (B, ctx, Latent)
         flow_standardize_latents: bool — whether to standardize inputs to the flow model
+        flow_cfg_scale: float — scale for Classifier-Free Guidance (CFG)
         
         Returns:
             all_states_seq: (chunk_size + 1, B, D)  — includes start state
@@ -289,6 +290,7 @@ class World(nn.Module):
                 ctx_states=ctx_states_norm,
                 future_action_emb=future_action_emb,
                 num_steps=self.dynamics_flow.num_euler_steps,
+                cfg_scale=flow_cfg_scale,
             )  # (B, chunk_size, D)
             imagined_states = self.latent_rms.denormalize(imagined_states_norm)
         else:
@@ -296,6 +298,7 @@ class World(nn.Module):
                 ctx_states=start_states,
                 future_action_emb=future_action_emb,
                 num_steps=self.dynamics_flow.num_euler_steps,
+                cfg_scale=flow_cfg_scale,
             )  # (B, chunk_size, D)
         
         # Prepend the starting state to get chunk_size + 1 states
