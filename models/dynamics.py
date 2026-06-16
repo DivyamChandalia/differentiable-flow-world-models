@@ -297,15 +297,13 @@ class FlowMatchingDynamics(nn.Module):
         noise = torch.randn_like(source_states)
         z_0 = source_states + self.source_noise_sigma * noise  # (B, H, D)
 
-        # Per-position uniform time sampling — each position gets its own
-        # t ∈ [0, 1], exposing the model to diverse interpolation scenarios.
-        # This breaks the symmetry where all positions see identical z_t at
-        # the same t, forcing the model to use action conditioning to
-        # differentiate positions rather than relying on z_t alone.
-        t = torch.rand(B, H, device=target_states.device)  # (B, H)
+        # Per-sequence uniform time sampling
+        # We MUST sample a single t per sequence to avoid target leakage across positions
+        # during joint denoising of the trajectory block.
+        t = torch.rand(B, device=target_states.device)  # (B,)
 
-        # OT interpolation: z_t = (1-t)*z_0 + t*z_1, per position
-        t_expanded = t.unsqueeze(-1)                          # (B, H, 1)
+        # OT interpolation: z_t = (1-t)*z_0 + t*z_1
+        t_expanded = t.view(B, 1, 1)                          # (B, 1, 1)
         z_t = (1.0 - t_expanded) * z_0 + t_expanded * target_states
 
         # Target velocity adapts to the noisy source: v* = z_1 - z_0

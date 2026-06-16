@@ -42,29 +42,28 @@ class Config:
     # Flow matching dynamics (for actor imagination)
     flow_num_layers: int = 6
     flow_num_heads: int = 4
-    flow_causal: bool = True   # Causal sequence mask: prevents future target leakage during training
+    flow_causal: bool = False   # Causal sequence mask: prevents future target leakage during training
     flow_num_euler_steps: int = 6
-    flow_source_noise_sigma: float = 0.05
+    flow_source_noise_sigma: float = 0.25
     flow_loss_weight: float = 1.0
     flow_detach_encoder: bool = True    # Stop-grad encoder outputs for flow model
     flow_distill_from_ar: bool = False  # If True, flow trains on AR predictions instead of encoder outputs
     flow_cfg_dropout: float = 0.15      # Probability of dropping context during flow training (CFG)
-    flow_cfg_scale: float = 3.0         # CFG extrapolation scale during actor imagination
+    flow_cfg_scale: float = 1.0         # CFG extrapolation scale during actor imagination
     flow_standardize_latents: bool = True # Standardize latents to standard normal for flow model
-    flow_adjoint_method: str = "none"   # Adjoint method ('none' or 'torchdiffeq')
-    flow_solver: str = "euler"          # Solver name ('euler', 'rk4', or 'dopri5')
+    flow_adjoint_method: str = "torchdiffeq"   # Adjoint method ('none' or 'torchdiffeq')
+    flow_solver: str = "rk4"          # Solver name ('euler', 'rk4', or 'dopri5')
     flow_solver_rtol: float = 1e-5      # Relative tolerance for adaptive solvers (dopri5)
     flow_solver_atol: float = 1e-7      # Absolute tolerance for adaptive solvers (dopri5)
     
-    max_frames: int = 18
-    world_horizon: int = 15
-    agent_horizon: int = 3
+    max_frames: int = 6
+    world_horizon: int = 3
+    imagination_ctx_frames: int = 3   # minimum real frames fed as context before imagining
+
     batch_size: int = 96  
     train_steps: int = 100
     num_epochs: int = 500
     
-    imagination_ctx_frames: int = 3   # minimum real frames fed as context before imagining
-
     world_agent_ratio: float = 1.0  
     
     world_lr: float = 1e-3
@@ -117,7 +116,7 @@ class Config:
                 f"wlr{self.world_lr}",
                 f"vlr{self.value_lr}",
                 f"wh{self.world_horizon}",
-                f"ah{self.agent_horizon}",
+                f"ah{self.imagination_ctx_frames}",
                 f"sig{self.sigreg_weight}"
             ]
             
@@ -223,9 +222,9 @@ class Trainer:
             decoder = None
             
         self.world = World(vision, dynamics_ar, dynamics_flow, action_enc, reward_enc, termination_enc, self.cfg.world_horizon, decoder=decoder).to(self.device)
-        self.actor = Actor(action_space=self.envs.get_action_space(), obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim, chunk_size=cfg.world_horizon, num_blocks=cfg.actor_num_blocks).to(self.device)
-        self.value_model = Value(obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
-        self.target_value_model = Value(obs_dim=cfg.agent_horizon * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
+        self.actor = Actor(action_space=self.envs.get_action_space(), obs_dim=cfg.imagination_ctx_frames * cfg.latent_dim, hidden_dim=cfg.hidden_dim, chunk_size=cfg.world_horizon, num_blocks=cfg.actor_num_blocks).to(self.device)
+        self.value_model = Value(obs_dim=cfg.imagination_ctx_frames * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
+        self.target_value_model = Value(obs_dim=cfg.imagination_ctx_frames * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
         self.target_value_model.load_state_dict(self.value_model.state_dict())
         self.target_value_model.eval()
         for p in self.target_value_model.parameters():
@@ -374,7 +373,7 @@ class Trainer:
         ep_returns = np.zeros(num_envs)
         active_envs = np.ones(num_envs, dtype=bool)
         
-        actor_history = deque(maxlen=self.cfg.agent_horizon)
+        actor_history = deque(maxlen=self.cfg.imagination_ctx_frames)
         frames = []
         step = 0
         
@@ -390,7 +389,7 @@ class Trainer:
                 # Maintain actor history and pad if necessary
                 actor_history.append(z_t)
                 history_list = list(actor_history)
-                while len(history_list) < self.cfg.agent_horizon:
+                while len(history_list) < self.cfg.imagination_ctx_frames:
                     history_list.insert(0, history_list[0])
                 
                 actor_input = torch.stack(history_list, dim=1).reshape(num_envs, -1)
@@ -517,11 +516,11 @@ class Trainer:
                 recon_loss = F.mse_loss(recon_obs.float(), obs_batch.float())
                 total_recon_loss = recon_loss
                 
-                if log_recon and pred_next_state is not None:
+                if log_recon and euler_full is not None:
                     if self.cfg.recon_train:
-                        recon_pred_obs = self.world.decoder(pred_next_state)
+                        recon_pred_obs = self.world.decoder(euler_full)
                     else:
-                        recon_pred_obs = self.world.decoder(pred_next_state.detach())
+                        recon_pred_obs = self.world.decoder(euler_full.detach())
                     recon_pred_loss = F.mse_loss(recon_pred_obs.float(), obs_batch[:, 1:].float())
             
         # Autoregressive dynamics loss (MSE to detached encoder targets)
@@ -643,15 +642,23 @@ class Trainer:
         AS = actions_idx.shape[-1]
         action_embedding = self.world.action(actions_idx.reshape(-1, AS)).reshape(1, actions_idx.size(1), -1)
         
-        # AR dynamics: feed all real states with causal masking (matches training forward)
+        # Open-loop AR dynamics (fair comparison with flow matching)
         T_act = act_batch.size(1)
-        current_states_idx = raw_states[idx:idx+1, :-1]  # (1, T_act, D) — all current states
         all_action_emb = self.world.action(act_batch[idx:idx+1].reshape(-1, AS)).reshape(1, T_act, -1)
-        ar_pred = self.world.dynamics_ar(current_states_idx, all_action_emb)  # (1, T_act, D)
         
-        # Decode AR predictions
-        recon_ar_pred_obs = self.world.decoder(ar_pred.detach())
-        ar_aligned = recon_ar_pred_obs[0, ctx-1:].detach().cpu()
+        ar_open_loop = []
+        curr_seq = raw_states[idx:idx+1, :ctx]  # (1, ctx, D)
+        
+        for i in range(T_act - ctx + 1):
+            act_seq = all_action_emb[:, :ctx + i]
+            pred = self.world.dynamics_ar(curr_seq, act_seq)
+            next_state = pred[:, -1:]  # (1, 1, D)
+            ar_open_loop.append(next_state)
+            curr_seq = torch.cat([curr_seq, next_state], dim=1)
+            
+        ar_aligned_states = torch.cat(ar_open_loop, dim=1) # (1, H, D)
+        recon_ar_pred_obs = self.world.decoder(ar_aligned_states.detach())
+        ar_aligned = recon_ar_pred_obs[0].detach().cpu()
         
         # 3. Flow matching Euler predictions
         if self.cfg.flow_standardize_latents:
@@ -676,7 +683,7 @@ class Trainer:
 
         # 4. Calculate predicted values for encoded and predicted states
         states_idx = raw_states[idx:idx+1].transpose(0, 1)
-        enc_windows = self._get_history_windows(states_idx, self.cfg.agent_horizon, context=None)
+        enc_windows = self._get_history_windows(states_idx, self.cfg.imagination_ctx_frames, context=None)
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             enc_vals_raw = self.value_model(enc_windows)
             if self.cfg.use_symlog:
@@ -819,9 +826,9 @@ class Trainer:
 
             # Seed the actor history with the real context frames
             history_list = list(ctx_windows.unbind(dim=1))
-            while len(history_list) < self.cfg.agent_horizon:
+            while len(history_list) < self.cfg.imagination_ctx_frames:
                 history_list.insert(0, history_list[0])
-            history_list = history_list[-self.cfg.agent_horizon:]
+            history_list = history_list[-self.cfg.imagination_ctx_frames:]
 
             actor_input = torch.stack(history_list, dim=1).reshape(self.cfg.batch_size, -1)
 
@@ -845,7 +852,7 @@ class Trainer:
                 flow_cfg_scale=self.cfg.flow_cfg_scale,
             )
 
-            history_windows = self._get_history_windows(imagined_states, self.cfg.agent_horizon, context=ctx_windows)
+            history_windows = self._get_history_windows(imagined_states, self.cfg.imagination_ctx_frames, context=ctx_windows)
 
             imagined_values = self.value_model(history_windows)
             
