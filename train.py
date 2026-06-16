@@ -51,7 +51,7 @@ class Config:
     flow_cfg_dropout: float = 0.15      # Probability of dropping context during flow training (CFG)
     flow_cfg_scale: float = 1.0         # CFG extrapolation scale during actor imagination
     flow_standardize_latents: bool = True # Standardize latents to standard normal for flow model
-    flow_adjoint_method: str = "torchdiffeq"   # Adjoint method ('none' or 'torchdiffeq')
+    flow_adjoint_method: str = "none"   # Adjoint method ('none' or 'torchdiffeq')
     flow_solver: str = "rk4"          # Solver name ('euler', 'rk4', or 'dopri5')
     flow_solver_rtol: float = 1e-5      # Relative tolerance for adaptive solvers (dopri5)
     flow_solver_atol: float = 1e-7      # Absolute tolerance for adaptive solvers (dopri5)

@@ -64,9 +64,9 @@ class ActionDistributionMonitor:
 
         with torch.amp.autocast(device_type=self.device.type, enabled=trainer.use_amp, dtype=trainer.amp_dtype):
             history_list = list(ctx_windows.unbind(dim=1))
-            while len(history_list) < cfg.agent_horizon:
+            while len(history_list) < cfg.imagination_ctx_frames:
                 history_list.insert(0, history_list[0])
-            history_list = history_list[-cfg.agent_horizon:]
+            history_list = history_list[-cfg.imagination_ctx_frames:]
 
             actor_input = torch.stack(history_list, dim=1).reshape(batch_size, -1)
 

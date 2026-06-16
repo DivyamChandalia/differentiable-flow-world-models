@@ -116,9 +116,9 @@ class LossLandscapeVisualizer:
         # Disable AMP during diagnostics to prevent bfloat16 truncation in finite differences
         with torch.amp.autocast(device_type=self.device.type, enabled=False):
             history_list = list(ctx_windows.unbind(dim=1))
-            while len(history_list) < cfg.agent_horizon:
+            while len(history_list) < cfg.imagination_ctx_frames:
                 history_list.insert(0, history_list[0])
-            history_list = history_list[-cfg.agent_horizon:]
+            history_list = history_list[-cfg.imagination_ctx_frames:]
 
             actor_input = torch.stack(history_list, dim=1).reshape(batch_size, -1)
 
@@ -135,7 +135,7 @@ class LossLandscapeVisualizer:
                 start_states=ctx_windows
             )
 
-            history_windows = trainer._get_history_windows(imagined_states, cfg.agent_horizon, context=ctx_windows)
+            history_windows = trainer._get_history_windows(imagined_states, cfg.imagination_ctx_frames, context=ctx_windows)
             ema_imagined_values = trainer.target_value_model(history_windows)
             imagined_values = trainer.value_model(history_windows)
 
@@ -304,9 +304,9 @@ class LossLandscapeVisualizer:
         # Disable AMP during diagnostics to prevent bfloat16 truncation in finite differences
         with torch.amp.autocast(device_type=self.device.type, enabled=False):
             history_list = list(ctx_windows.unbind(dim=1))
-            while len(history_list) < cfg.agent_horizon:
+            while len(history_list) < cfg.imagination_ctx_frames:
                 history_list.insert(0, history_list[0])
-            history_list = history_list[-cfg.agent_horizon:]
+            history_list = history_list[-cfg.imagination_ctx_frames:]
 
             actor_input = torch.stack(history_list, dim=1).reshape(batch_size, -1)
             
@@ -320,7 +320,7 @@ class LossLandscapeVisualizer:
                 actions=actions_full, start_states=ctx_windows
             )
 
-            history_windows = trainer._get_history_windows(imagined_states, cfg.agent_horizon, context=ctx_windows)
+            history_windows = trainer._get_history_windows(imagined_states, cfg.imagination_ctx_frames, context=ctx_windows)
             ema_imagined_values = trainer.target_value_model(history_windows)
             imagined_values = trainer.value_model(history_windows)
 
