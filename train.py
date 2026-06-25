@@ -38,23 +38,25 @@ class Config:
     dyn_num_layers: int = 6
     dyn_num_heads: int = 4
     dyn_causal: bool = True  # Causal: teacher-forced AR, mask prevents seeing future states
+    dyn_block_type: str = 'adaln'
     
     # Flow matching dynamics (for actor imagination)
     flow_num_layers: int = 6
     flow_num_heads: int = 4
     flow_causal: bool = False   # Causal sequence mask: prevents future target leakage during training
     flow_num_euler_steps: int = 6
-    flow_source_noise_sigma: float = 0.25
-    flow_loss_weight: float = 1.0
+    flow_source_noise_sigma: float = 1.0
+    flow_loss_weight: float = 0.1
     flow_detach_encoder: bool = True    # Stop-grad encoder outputs for flow model
     flow_distill_from_ar: bool = False  # If True, flow trains on AR predictions instead of encoder outputs
     flow_cfg_dropout: float = 0.15      # Probability of dropping context during flow training (CFG)
     flow_cfg_scale: float = 1.0         # CFG extrapolation scale during actor imagination
-    flow_standardize_latents: bool = True # Standardize latents to standard normal for flow model
+    flow_standardize_latents: bool = False # Standardize latents to standard normal for flow model
     flow_adjoint_method: str = "none"   # Adjoint method ('none' or 'torchdiffeq')
-    flow_solver: str = "rk4"          # Solver name ('euler', 'rk4', or 'dopri5')
+    flow_solver: str = "euler"          # Solver name ('euler', 'rk4', or 'dopri5')
     flow_solver_rtol: float = 1e-5      # Relative tolerance for adaptive solvers (dopri5)
     flow_solver_atol: float = 1e-7      # Absolute tolerance for adaptive solvers (dopri5)
+    imagination_mode: str = 'flow'      # 'flow' or 'ar'
     
     max_frames: int = 6
     world_horizon: int = 3
@@ -75,18 +77,19 @@ class Config:
     value_target_tau: float = 0.02
     
     use_sigreg: bool = True
-    sigreg_weight: float = 0.1
+    sigreg_weight: float = 0.03
     weak_sigreg: bool = True     # if True, use WeakSIGReg (Frobenius cov loss) instead of SIGReg
     entropy_scale: float = 3e-3
-    use_return_ema: bool = True
+    use_return_ema: bool = False
     use_advantage: bool = False
     reinforce: bool = False
     discount: float = 0.99
+    return_lambda: float = 0.99
     actor_num_blocks: int = 4
     value_num_blocks: int = 4
     use_symlog: bool = True
 
-    buffer_capacity: int = 150
+    buffer_capacity: int = 50
     prefill_episodes: int = 50
     world_bootstrap_steps: int = 500  # extra WM-only gradient steps run after prefill, before training loop
     
@@ -201,6 +204,7 @@ class Trainer:
             action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim,
             num_layers=cfg.dyn_num_layers, num_heads=cfg.dyn_num_heads,
             causal=cfg.dyn_causal,
+            block_type=cfg.dyn_block_type,
         )
         dynamics_flow = FlowMatchingDynamics(
             max_frames=cfg.max_frames + cfg.imagination_ctx_frames,
@@ -234,7 +238,7 @@ class Trainer:
             self.sig_reg = WeakSIGReg().to(self.device)
         else:
             self.sig_reg = SIGReg().to(self.device)
-        self.value_loss_fn = ValueLoss(discount=cfg.discount, batch_first=False, use_symlog=cfg.use_symlog)
+        self.value_loss_fn = ValueLoss(discount=cfg.discount, lambda_=cfg.return_lambda, batch_first=False, use_symlog=cfg.use_symlog)
         self.actor_loss_fn = ActorLoss(discount=cfg.discount, batch_first=False, entropy_scale=cfg.entropy_scale, reinforce=cfg.reinforce)
         self.return_ema = ReturnEMA(decay=0.99).to(self.device) if cfg.use_return_ema else None
         
@@ -254,11 +258,12 @@ class Trainer:
 
         # Diagnostics
         if cfg.diag_enabled:
-            from diagnostics import LossLandscapeVisualizer, GradientFlowAnalyzer, ActionDistributionMonitor, FlowDiagnostics
+            from diagnostics import LossLandscapeVisualizer, GradientFlowAnalyzer, ActionDistributionMonitor, FlowDiagnostics, ARDiagnostics
             self.landscape_viz = LossLandscapeVisualizer(self)
             self.grad_analyzer = GradientFlowAnalyzer(self)
             self.action_monitor = ActionDistributionMonitor(self)
             self.flow_diagnostics = FlowDiagnostics(self)
+            self.ar_diagnostics = ARDiagnostics(self)
             self.diag_output_dir = os.path.join(cfg.log_dir, 'diagnostics')
 
     def set_seed(self, seed):
@@ -496,17 +501,19 @@ class Trainer:
         log_recon = self.cfg.recon_debug and (self.world_step % self.cfg.train_steps == 0)
         
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-            raw_states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss, euler_full = self.world(
+            raw_states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss, euler_full, ar_full = self.world(
                 act_batch, obs_batch, ctx_frames=self.cfg.imagination_ctx_frames, run_euler=log_recon,
                 flow_detach_encoder=self.cfg.flow_detach_encoder,
                 flow_distill_from_ar=self.cfg.flow_distill_from_ar,
                 flow_standardize_latents=self.cfg.flow_standardize_latents,
                 flow_cfg_dropout=self.cfg.flow_cfg_dropout,
                 flow_cfg_scale=self.cfg.flow_cfg_scale,
+                run_flow=(self.cfg.imagination_mode == 'flow'),
             )
             
             recon_loss = None
             recon_pred_loss = None
+            recon_pred_loss_ar = None
             if self.cfg.recon_debug:
                 if self.cfg.recon_train:
                     recon_obs = self.world.decoder(raw_states)
@@ -522,12 +529,22 @@ class Trainer:
                     else:
                         recon_pred_obs = self.world.decoder(euler_full.detach())
                     recon_pred_loss = F.mse_loss(recon_pred_obs.float(), obs_batch[:, 1:].float())
+ 
+                if log_recon and ar_full is not None:
+                    if self.cfg.recon_train:
+                        recon_pred_obs_ar = self.world.decoder(ar_full)
+                    else:
+                        recon_pred_obs_ar = self.world.decoder(ar_full.detach())
+                    recon_pred_loss_ar = F.mse_loss(recon_pred_obs_ar.float(), obs_batch[:, 1:].float())
             
         # Autoregressive dynamics loss (MSE to detached encoder targets)
         ar_dyn_loss = F.mse_loss(pred_next_state.float(), target_state.detach().float())
         
         # Flow matching velocity loss (separate, optionally detached from encoder)
-        flow_loss = self.cfg.flow_loss_weight * velocity_loss
+        if self.cfg.imagination_mode == 'flow':
+            flow_loss = self.cfg.flow_loss_weight * velocity_loss
+        else:
+            flow_loss = torch.tensor(0.0, device=self.device)
         
         # Combined dynamics loss (AR + flow)
         dyn_loss = ar_dyn_loss + flow_loss
@@ -557,9 +574,12 @@ class Trainer:
         ar_dyn_grad_norm = self._compute_grad_norm(self.world) / scale_factor
         
         # Flow Velocity Loss
-        self.world_opt.zero_grad(set_to_none=True)
-        self.scaler.scale(flow_loss).backward(retain_graph=True)
-        flow_grad_norm = self._compute_grad_norm(self.world) / scale_factor
+        if self.cfg.imagination_mode == 'flow':
+            self.world_opt.zero_grad(set_to_none=True)
+            self.scaler.scale(flow_loss).backward(retain_graph=True)
+            flow_grad_norm = self._compute_grad_norm(self.world) / scale_factor
+        else:
+            flow_grad_norm = 0.0
         
         # Reward Loss
         self.world_opt.zero_grad(set_to_none=True)
@@ -613,6 +633,8 @@ class Trainer:
             self.writer.add_scalar('Loss/World_Reconstruction', recon_loss.item(), self.world_step)
             if recon_pred_loss is not None:
                 self.writer.add_scalar('Loss/World_Reconstruction_Pred', recon_pred_loss.item(), self.world_step)
+            if recon_pred_loss_ar is not None:
+                self.writer.add_scalar('Loss/World_Reconstruction_Pred_AR', recon_pred_loss_ar.item(), self.world_step)
             self.writer.add_scalar('GradNorm/World_Reconstruction', recon_grad_norm, self.world_step)
             
         self.writer.add_scalar('GradNorm/World', grad_norm, self.world_step)
@@ -661,25 +683,38 @@ class Trainer:
         ar_aligned = recon_ar_pred_obs[0].detach().cpu()
         
         # 3. Flow matching Euler predictions
-        if self.cfg.flow_standardize_latents:
-            ctx_states_norm = self.world.latent_rms.normalize(ctx_states)
-            euler_pred_norm = self.world.dynamics_flow.generate(
-                ctx_states_norm, action_embedding, cfg_scale=self.cfg.flow_cfg_scale
-            )
-            euler_pred = self.world.latent_rms.denormalize(euler_pred_norm)
-        else:
-            euler_pred = self.world.dynamics_flow.generate(
-                ctx_states, action_embedding, cfg_scale=self.cfg.flow_cfg_scale
-            )
-        
-        # Align/pad to match predicted next states format
-        if ctx > 1:
-            flow_pred_next_state = torch.cat([raw_states[idx:idx+1, 1:ctx], euler_pred], dim=1)
-        else:
-            flow_pred_next_state = euler_pred
+        if self.cfg.imagination_mode == 'flow':
+            if self.cfg.flow_standardize_latents:
+                ctx_states_norm = self.world.latent_rms.normalize(ctx_states)
+                euler_pred_norm = self.world.dynamics_flow.generate(
+                    ctx_states_norm, action_embedding, cfg_scale=self.cfg.flow_cfg_scale
+                )
+                euler_pred = self.world.latent_rms.denormalize(euler_pred_norm)
+            else:
+                euler_pred = self.world.dynamics_flow.generate(
+                    ctx_states, action_embedding, cfg_scale=self.cfg.flow_cfg_scale
+                )
             
-        recon_flow_pred_obs = self.world.decoder(flow_pred_next_state.detach())
-        flow_aligned = recon_flow_pred_obs[0, ctx-1:].detach().cpu()
+            # Align/pad to match predicted next states format
+            if ctx > 1:
+                flow_pred_next_state = torch.cat([raw_states[idx:idx+1, 1:ctx], euler_pred], dim=1)
+            else:
+                flow_pred_next_state = euler_pred
+                
+            recon_flow_pred_obs = self.world.decoder(flow_pred_next_state.detach())
+            flow_aligned = recon_flow_pred_obs[0, ctx-1:].detach().cpu()
+
+            # Flow matching value predictions
+            flow_windows = self._get_history_windows(euler_pred.transpose(0, 1), self.cfg.imagination_ctx_frames, context=ctx_states)
+            with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                flow_vals_raw = self.value_model(flow_windows)
+                if self.cfg.use_symlog:
+                    flow_vals_raw = symexp(flow_vals_raw)
+                flow_values = flow_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()
+        else:
+            euler_pred = None
+            flow_aligned = None
+            flow_values = None
 
         # 4. Calculate predicted values for encoded and predicted states
         states_idx = raw_states[idx:idx+1].transpose(0, 1)
@@ -689,6 +724,14 @@ class Trainer:
             if self.cfg.use_symlog:
                 enc_vals_raw = symexp(enc_vals_raw)
             enc_values = enc_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()[ctx:]
+
+        # AR model value predictions
+        ar_windows = self._get_history_windows(ar_aligned_states.transpose(0, 1), self.cfg.imagination_ctx_frames, context=ctx_states)
+        with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+            ar_vals_raw = self.value_model(ar_windows)
+            if self.cfg.use_symlog:
+                ar_vals_raw = symexp(ar_vals_raw)
+            ar_values = ar_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()
 
         # Draw values on encoded frames
         encoded_with_val = []
@@ -705,69 +748,110 @@ class Trainer:
             encoded_with_val.append(to_tensor(img_pil))
         encoded_with_val = torch.stack(encoded_with_val, dim=0)
 
-        def annotate_frames(frames_cpu, mode_text, mode_color):
-            """Add mode label to bottom of each frame."""
+        def annotate_frames(frames_cpu, mode_text, mode_color, values_array=None):
+            """Add mode label to bottom of each frame and value to top left."""
             annotated = []
             for t in range(frames_cpu.size(0)):
                 frame = frames_cpu[t].float()
                 img_pil = to_pil_image(frame)
                 draw = ImageDraw.Draw(img_pil)
                 w, h = img_pil.size
+                
+                # Bottom mode label
                 x_m, y_m = 2, h - 12
                 for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
                     draw.text((x_m + dx, y_m + dy), mode_text, fill="black")
                 draw.text((x_m, y_m), mode_text, fill=mode_color)
+                
+                # Top value label if provided
+                if values_array is not None:
+                    val = values_array[t]
+                    val_text = f"v:{val:.2f}"
+                    x_v, y_v = 2, 2
+                    for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
+                        draw.text((x_v + dx, y_v + dy), val_text, fill="black")
+                    draw.text((x_v, y_v), val_text, fill="white")
+                    
                 annotated.append(to_tensor(img_pil))
             return torch.stack(annotated, dim=0)
         
-        ar_annotated = annotate_frames(ar_aligned, "AR", "cyan")
-        flow_annotated = annotate_frames(flow_aligned, "FLOW", "red")
+        ar_annotated = annotate_frames(ar_aligned, "AR", "cyan", values_array=ar_values)
         
         grid_actual = torchvision.utils.make_grid(actual, nrow=actual.size(0), normalize=False)
         grid_encoded = torchvision.utils.make_grid(encoded_with_val, nrow=encoded_with_val.size(0), normalize=False)
         grid_ar = torchvision.utils.make_grid(ar_annotated, nrow=ar_annotated.size(0), normalize=False)
-        grid_flow = torchvision.utils.make_grid(flow_annotated, nrow=flow_annotated.size(0), normalize=False)
         
-        combined_grid = torch.cat([grid_actual, grid_encoded, grid_ar, grid_flow], dim=1)
-        self.writer.add_image('Reconstruction/Actual_vs_Encoded_vs_AR_vs_Flow', combined_grid, self.world_step)
+        if self.cfg.imagination_mode == 'flow':
+            flow_annotated = annotate_frames(flow_aligned, "FLOW", "red", values_array=flow_values)
+            grid_flow = torchvision.utils.make_grid(flow_annotated, nrow=flow_annotated.size(0), normalize=False)
+            combined_grid = torch.cat([grid_actual, grid_encoded, grid_ar, grid_flow], dim=1)
+            self.writer.add_image('Reconstruction/Actual_vs_Encoded_vs_AR_vs_Flow', combined_grid, self.world_step)
+        else:
+            combined_grid = torch.cat([grid_actual, grid_encoded, grid_ar], dim=1)
+            self.writer.add_image('Reconstruction/Actual_vs_Encoded_vs_AR', combined_grid, self.world_step)
+
+        # Plot predicted values comparison
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            
+            fig, ax = plt.subplots(figsize=(6, 4))
+            timesteps = np.arange(len(enc_values))
+            ax.plot(timesteps, enc_values, label='Encoded (GT)', color='green', marker='o')
+            ax.plot(timesteps, ar_values, label='AR Imagination', color='cyan', marker='s')
+            if self.cfg.imagination_mode == 'flow':
+                ax.plot(timesteps, flow_values, label='FLOW Imagination', color='red', marker='^')
+            ax.set_xlabel('Imagination Steps')
+            ax.set_ylabel('Predicted Value')
+            ax.set_title(f'Value Predictions Comparison (Step {self.world_step})')
+            ax.legend()
+            ax.grid(True)
+            plt.tight_layout()
+            
+            self.writer.add_figure('Reconstruction/Value_Predictions', fig, self.world_step)
+            plt.close(fig)
+        except Exception as e:
+            print(f"Failed to log value predictions plot: {e}")
         
         # --- Velocity field diagnostics ---
-        target_states_all = raw_states[idx:idx+1, 1:]
-        future_targets = target_states_all[:, ctx-1:]
-        source = ctx_states[:, -1:].expand_as(euler_pred)
-        v_gt = future_targets - source
-        
-        v_at_0 = self.world.dynamics_flow.compute_velocity(
-            source.clone(), torch.zeros(1, device=source.device), ctx_states, action_embedding
-        )
-        v_at_05 = self.world.dynamics_flow.compute_velocity(
-            0.5 * source + 0.5 * future_targets,
-            torch.full((1,), 0.5, device=source.device), ctx_states, action_embedding
-        )
-        v_at_09 = self.world.dynamics_flow.compute_velocity(
-            0.1 * source + 0.9 * future_targets,
-            torch.full((1,), 0.9, device=source.device), ctx_states, action_embedding
-        )
-        
-        mse_t0 = (v_at_0 - v_gt).pow(2).mean().item()
-        mse_t05 = (v_at_05 - v_gt).pow(2).mean().item()
-        mse_t09 = (v_at_09 - v_gt).pow(2).mean().item()
-        self.writer.add_scalar('Diag/Velocity_MSE_t0', mse_t0, self.world_step)
-        self.writer.add_scalar('Diag/Velocity_MSE_t05', mse_t05, self.world_step)
-        self.writer.add_scalar('Diag/Velocity_MSE_t09', mse_t09, self.world_step)
-        
-        cos_t0 = torch.nn.functional.cosine_similarity(
-            v_at_0.reshape(1, -1), v_gt.reshape(1, -1), dim=1
-        ).item()
-        self.writer.add_scalar('Diag/Velocity_Cosine_t0', cos_t0, self.world_step)
-        
-        euler_pos_var = euler_pred.var(dim=1).mean().item()
-        target_pos_var = future_targets.var(dim=1).mean().item()
-        self.writer.add_scalar('Diag/Euler_PositionVariance', euler_pos_var, self.world_step)
-        self.writer.add_scalar('Diag/Target_PositionVariance', target_pos_var, self.world_step)
-        
-        euler_mse = (euler_pred - future_targets).pow(2).mean().item()
-        self.writer.add_scalar('Diag/Euler_MSE_to_Target', euler_mse, self.world_step)
+        if self.cfg.imagination_mode == 'flow':
+            target_states_all = raw_states[idx:idx+1, 1:]
+            future_targets = target_states_all[:, ctx-1:]
+            source = ctx_states[:, -1:].expand_as(euler_pred)
+            v_gt = future_targets - source
+            
+            v_at_0 = self.world.dynamics_flow.compute_velocity(
+                source.clone(), torch.zeros(1, device=source.device), ctx_states, action_embedding
+            )
+            v_at_05 = self.world.dynamics_flow.compute_velocity(
+                0.5 * source + 0.5 * future_targets,
+                torch.full((1,), 0.5, device=source.device), ctx_states, action_embedding
+            )
+            v_at_09 = self.world.dynamics_flow.compute_velocity(
+                0.1 * source + 0.9 * future_targets,
+                torch.full((1,), 0.9, device=source.device), ctx_states, action_embedding
+            )
+            
+            mse_t0 = (v_at_0 - v_gt).pow(2).mean().item()
+            mse_t05 = (v_at_05 - v_gt).pow(2).mean().item()
+            mse_t09 = (v_at_09 - v_gt).pow(2).mean().item()
+            self.writer.add_scalar('Diag/Velocity_MSE_t0', mse_t0, self.world_step)
+            self.writer.add_scalar('Diag/Velocity_MSE_t05', mse_t05, self.world_step)
+            self.writer.add_scalar('Diag/Velocity_MSE_t09', mse_t09, self.world_step)
+            
+            cos_t0 = torch.nn.functional.cosine_similarity(
+                v_at_0.reshape(1, -1), v_gt.reshape(1, -1), dim=1
+            ).item()
+            self.writer.add_scalar('Diag/Velocity_Cosine_t0', cos_t0, self.world_step)
+            
+            euler_pos_var = euler_pred.var(dim=1).mean().item()
+            target_pos_var = future_targets.var(dim=1).mean().item()
+            self.writer.add_scalar('Diag/Euler_PositionVariance', euler_pos_var, self.world_step)
+            self.writer.add_scalar('Diag/Target_PositionVariance', target_pos_var, self.world_step)
+            
+            euler_mse = (euler_pred - future_targets).pow(2).mean().item()
+            self.writer.add_scalar('Diag/Euler_MSE_to_Target', euler_mse, self.world_step)
 
     def train_agent(self, start_states, real_actions):
         """
@@ -850,6 +934,7 @@ class Trainer:
                 start_states=ctx_windows,
                 flow_standardize_latents=self.cfg.flow_standardize_latents,
                 flow_cfg_scale=self.cfg.flow_cfg_scale,
+                imagination_mode=self.cfg.imagination_mode,
             )
 
             history_windows = self._get_history_windows(imagined_states, self.cfg.imagination_ctx_frames, context=ctx_windows)
@@ -979,6 +1064,10 @@ class Trainer:
 
     def _run_inline_diagnostics(self, start_states, real_actions):
         """Run actor diagnostics and log results to TensorBoard + save plots."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
         step = self.agent_step
         save_dir = os.path.join(self.diag_output_dir, f'step_{step:06d}')
         os.makedirs(save_dir, exist_ok=True)
@@ -991,16 +1080,27 @@ class Trainer:
 
         try:
             # 0. Flow matching diagnostics (PCA trajectories and velocity fields)
-            flow_data = self.flow_diagnostics.collect_flow_data(start_states, real_actions)
-            fig_traj = self.flow_diagnostics.plot_flow_trajectories(flow_data, save_dir=save_dir)
-            if fig_traj is not None:
-                self.writer.add_figure('Diag/Flow_Trajectories', fig_traj, step)
-            self.writer.add_scalar('Diag/Flow_Cosine_Sim_t0', flow_data['cos_sim'], step)
-            self.writer.add_scalar('Diag/Flow_Dist_to_Target_Mean', flow_data['dist_to_target'], step)
+            if self.cfg.imagination_mode == 'flow':
+                flow_data = self.flow_diagnostics.collect_flow_data(start_states, real_actions)
+                fig_traj = self.flow_diagnostics.plot_flow_trajectories(flow_data, save_dir=save_dir)
+                if fig_traj is not None:
+                    self.writer.add_figure('Diag/Flow_Trajectories', fig_traj, step)
+                    plt.close(fig_traj)
+                self.writer.add_scalar('Diag/Flow_Cosine_Sim_t0', flow_data['cos_sim'], step)
+                self.writer.add_scalar('Diag/Flow_Dist_to_Target_Mean', flow_data['dist_to_target'], step)
 
             # 1. Action distribution stats (fast)
             action_stats = self.action_monitor.collect_action_stats(start_states, real_actions)
-            self.action_monitor.plot_action_stats(action_stats, save_dir=save_dir)
+            fig_health, fig_hist, fig_profile = self.action_monitor.plot_action_stats(action_stats, save_dir=save_dir)
+            if fig_health is not None:
+                self.writer.add_figure('Diag/Action_Health', fig_health, step)
+                plt.close(fig_health)
+            if fig_hist is not None:
+                self.writer.add_figure('Diag/Action_PreTanh_Hist', fig_hist, step)
+                plt.close(fig_hist)
+            if fig_profile is not None:
+                self.writer.add_figure('Diag/Action_Profile', fig_profile, step)
+                plt.close(fig_profile)
 
             self.writer.add_scalar('Diag/PreTanh_MeanAbs_Max', float(action_stats['pre_tanh_mean_abs'].max()), step)
             self.writer.add_scalar('Diag/PostTanh_MeanAbs_Max', float(action_stats['post_tanh_mean_abs'].max()), step)
@@ -1013,7 +1113,11 @@ class Trainer:
                 grid_size=self.cfg.diag_landscape_grid,
                 range_scale=self.cfg.diag_landscape_range
             )
-            self.landscape_viz.plot_landscape(landscape_data, save_dir=save_dir)
+            landscape_figs = self.landscape_viz.plot_landscape(landscape_data, save_dir=save_dir)
+            if landscape_figs is not None:
+                for fig_name, fig in landscape_figs.items():
+                    self.writer.add_figure(f'Diag/Landscape_{fig_name.title()}', fig, step)
+                    plt.close(fig)
 
             total = landscape_data['total_loss']
             center = total[self.cfg.diag_landscape_grid // 2, self.cfg.diag_landscape_grid // 2]
@@ -1026,14 +1130,20 @@ class Trainer:
                 start_states, real_actions, num_points=21,
                 range_scale=self.cfg.diag_landscape_range
             )
-            self.landscape_viz.plot_gradient_slice(slice_data, save_dir=save_dir)
+            fig_slice = self.landscape_viz.plot_gradient_slice(slice_data, save_dir=save_dir)
+            if fig_slice is not None:
+                self.writer.add_figure('Diag/Gradient_Slice', fig_slice, step)
+                plt.close(fig_slice)
             if slice_data:
                 self.writer.add_scalar('Diag/GradNorm_Actor', slice_data['grad_norm'], step)
 
             # 4. Per-layer gradient norms
             self.landscape_viz._run_actor_forward_with_grad(start_states, real_actions)
             norms = self.grad_analyzer.per_layer_grad_norms()
-            self.grad_analyzer.plot_grad_norms(norms, save_dir=save_dir)
+            fig_norms = self.grad_analyzer.plot_grad_norms(norms, save_dir=save_dir)
+            if fig_norms is not None:
+                self.writer.add_figure('Diag/Grad_Norms', fig_norms, step)
+                plt.close(fig_norms)
 
             vanishing = sum(1 for v in norms.values() if v < 1e-7)
             self.writer.add_scalar('Diag/VanishingLayers', vanishing, step)
@@ -1043,20 +1153,36 @@ class Trainer:
                 fd_data = self.grad_analyzer.finite_difference_check(
                     start_states, real_actions, num_params=self.cfg.diag_fd_params
                 )
-                self.grad_analyzer.plot_fd_comparison(fd_data, save_dir=save_dir)
+                fig_fd = self.grad_analyzer.plot_fd_comparison(fd_data, save_dir=save_dir)
+                if fig_fd is not None:
+                    self.writer.add_figure('Diag/FD_Check', fig_fd, step)
+                    plt.close(fig_fd)
                 self.writer.add_scalar('Diag/FD_CosineSim', fd_data['cosine_similarity'], step)
                 self.writer.add_scalar('Diag/FD_RelError', fd_data['mean_relative_error'], step)
+
+            # 6. Autoregressive action impact diagnostics
+            ar_data = self.ar_diagnostics.collect_ar_data(start_states, real_actions)
+            fig_ar = self.ar_diagnostics.plot_ar_trajectories(ar_data, save_dir=save_dir)
+            if fig_ar is not None:
+                self.writer.add_figure('Diag/AR_Action_Impact', fig_ar, step)
+                plt.close(fig_ar)
+            self.writer.add_scalar('Diag/AR_Zero_Action_MSE_Final', ar_data['mse_zero'][-1], step)
+            self.writer.add_scalar('Diag/AR_Rand_Action_MSE_Final', ar_data['mse_rand'][-1], step)
+            self.writer.add_scalar('Diag/AR_Opp_Action_MSE_Final', ar_data['mse_opp'][-1], step)
+            self.writer.add_scalar('Diag/AR_Dist_to_Target', ar_data['dist_to_target'], step)
 
             print(f"[Diagnostics] Done. Plots saved to {save_dir}")
 
         except Exception as e:
+            import traceback
             print(f"[Diagnostics] Error: {e}")
+            traceback.print_exc()
         finally:
             if was_training_actor:
                 self.actor.train()
             if was_training_value:
                 self.value_model.train()
-    
+
     def run(self):
         try:
             print(f"Pre-filling buffer with {self.cfg.prefill_episodes} episodes...")

@@ -308,3 +308,95 @@ class ConditionalTransformer(nn.Module):
         if new_kv_cache is not None:
             return x, new_kv_cache
         return x
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.kv_proj = nn.Linear(dim, dim * 2, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        
+    def forward(self, x_query, x_kv):
+        """
+        x_query: (B, T_q, dim)
+        x_kv: (B, T_kv, dim)
+        """
+        B, T_q, C = x_query.shape
+        T_kv = x_kv.shape[1]
+        
+        q = self.q_proj(x_query)  # (B, T_q, C)
+        kv = self.kv_proj(x_kv)    # (B, T_kv, 2*C)
+        k, v = kv.chunk(2, dim=-1)
+        
+        q = q.view(B, T_q, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Cross attention is not causal
+        x = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        
+        x = x.transpose(1, 2).contiguous().view(B, T_q, C)
+        x = self.proj(x)
+        return x
+
+
+class FutureFlowBlock(nn.Module):
+    def __init__(self, dim, num_heads, cond_dim, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm3 = nn.LayerNorm(dim, elementwise_affine=False)
+        
+        self.self_attn = SelfAttention(dim, num_heads, causal=False)
+        self.cross_attn = CrossAttention(dim, num_heads)
+        
+        mlp_hidden_dim = int(dim * mlp_ratio * (2/3))
+        self.mlp = SwiGLUMLP(dim, mlp_hidden_dim) 
+
+        self.adaln_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, 9 * dim, bias=True)
+        )
+
+        nn.init.zeros_(self.adaln_modulation[-1].weight)
+        nn.init.zeros_(self.adaln_modulation[-1].bias)
+
+    def forward(self, future, past, cond, freqs_cis=None):
+        (shift_sa, scale_sa, gate_sa, 
+         shift_xa, scale_xa, gate_xa,
+         shift_mlp, scale_mlp, gate_mlp) = self.adaln_modulation(cond).chunk(9, dim=-1)
+
+        # Unsqueeze for broadcasting to [B, H, dim]
+        shift_sa = shift_sa.unsqueeze(1)
+        scale_sa = scale_sa.unsqueeze(1)
+        gate_sa = gate_sa.unsqueeze(1)
+        
+        shift_xa = shift_xa.unsqueeze(1)
+        scale_xa = scale_xa.unsqueeze(1)
+        gate_xa = gate_xa.unsqueeze(1)
+        
+        shift_mlp = shift_mlp.unsqueeze(1)
+        scale_mlp = scale_mlp.unsqueeze(1)
+        gate_mlp = gate_mlp.unsqueeze(1)
+
+        # 1. Self-attention over future tokens
+        future_norm1 = modulate(self.norm1(future), shift_sa, scale_sa)
+        sa_out, _ = self.self_attn(future_norm1, freqs_cis=freqs_cis)
+        future = future + gate_sa * sa_out
+
+        # 2. Cross-attention from future tokens (queries) to past context tokens (keys/values)
+        future_norm2 = modulate(self.norm2(future), shift_xa, scale_xa)
+        xa_out = self.cross_attn(future_norm2, past)
+        future = future + gate_xa * xa_out
+
+        # 3. MLP
+        future_norm3 = modulate(self.norm3(future), shift_mlp, scale_mlp)
+        mlp_out = self.mlp(future_norm3)
+        future = future + gate_mlp * mlp_out
+
+        return future

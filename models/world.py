@@ -77,7 +77,7 @@ class World(nn.Module):
     def forward(self, actions, observations, ctx_frames=None, run_euler=False,
                 flow_detach_encoder=True, flow_distill_from_ar=False,
                 flow_standardize_latents=True, flow_cfg_dropout=0.0,
-                flow_cfg_scale=1.0):
+                flow_cfg_scale=1.0, run_flow=True):
         '''
         Training forward pass with dual dynamics.
 
@@ -100,6 +100,7 @@ class World(nn.Module):
             flow_distill_from_ar: bool — if True, flow model trains on AR predictions
                                          instead of encoder outputs
             flow_standardize_latents: bool — if True, standardize latents for flow matching
+            run_flow:            bool — if True, run flow matching forward and compute loss
 
         Returns:
             states:            (B, T, D)     all encoded states
@@ -143,64 +144,85 @@ class World(nn.Module):
         # =====================================================================
         flow_ctx_frames = ctx_frames if (ctx_frames is not None and ctx_frames < T_act) else 1
 
-        if flow_distill_from_ar:
-            # Train flow model to match AR predictions (distillation)
-            flow_future_targets = pred_next_state[:, flow_ctx_frames - 1:].detach()
+        if run_flow:
+            if flow_distill_from_ar:
+                # Train flow model to match AR predictions (distillation)
+                flow_future_targets = pred_next_state[:, flow_ctx_frames - 1:].detach()
+            else:
+                # Train flow model on encoder outputs
+                flow_future_targets = target_state[:, flow_ctx_frames - 1:]
+
+            flow_ctx_states = current_states[:, :flow_ctx_frames]
+            flow_future_act = action_embedding[:, flow_ctx_frames - 1:]
+
+            if flow_detach_encoder:
+                # Stop-grad: flow model doesn't influence encoder learning
+                flow_ctx_states = flow_ctx_states.detach()
+                flow_future_targets = flow_future_targets.detach()
+                flow_future_act = flow_future_act.detach()
+
+            flow_source = flow_ctx_states[:, -1:].expand_as(flow_future_targets)
+
+            if flow_standardize_latents:
+                flow_ctx_states_norm = self.latent_rms.normalize(flow_ctx_states)
+                flow_future_targets_norm = self.latent_rms.normalize(flow_future_targets)
+                flow_source_norm = self.latent_rms.normalize(flow_source)
+                velocity_loss = self.dynamics_flow(
+                    flow_ctx_states_norm, flow_future_act, flow_future_targets_norm, flow_source_norm,
+                    cfg_dropout=flow_cfg_dropout
+                )
+            else:
+                velocity_loss = self.dynamics_flow(
+                    flow_ctx_states, flow_future_act, flow_future_targets, flow_source,
+                    cfg_dropout=flow_cfg_dropout
+                )
         else:
-            # Train flow model on encoder outputs
-            flow_future_targets = target_state[:, flow_ctx_frames - 1:]
-
-        flow_ctx_states = current_states[:, :flow_ctx_frames]
-        flow_future_act = action_embedding[:, flow_ctx_frames - 1:]
-
-        if flow_detach_encoder:
-            # Stop-grad: flow model doesn't influence encoder learning
-            flow_ctx_states = flow_ctx_states.detach()
-            flow_future_targets = flow_future_targets.detach()
-            flow_future_act = flow_future_act.detach()
-
-        flow_source = flow_ctx_states[:, -1:].expand_as(flow_future_targets)
-
-        if flow_standardize_latents:
-            flow_ctx_states_norm = self.latent_rms.normalize(flow_ctx_states)
-            flow_future_targets_norm = self.latent_rms.normalize(flow_future_targets)
-            flow_source_norm = self.latent_rms.normalize(flow_source)
-            velocity_loss = self.dynamics_flow(
-                flow_ctx_states_norm, flow_future_act, flow_future_targets_norm, flow_source_norm,
-                cfg_dropout=flow_cfg_dropout
-            )
-        else:
-            velocity_loss = self.dynamics_flow(
-                flow_ctx_states, flow_future_act, flow_future_targets, flow_source,
-                cfg_dropout=flow_cfg_dropout
-            )
+            velocity_loss = torch.tensor(0.0, device=actions.device)
 
         # =====================================================================
         # Euler solve for reconstruction visualization (optional, no grad)
         # =====================================================================
         euler_full = None
+        ar_full = None
         if run_euler:
             with torch.no_grad():
-                euler_ctx = current_states[:, :flow_ctx_frames].detach()
-                euler_act = action_embedding[:, flow_ctx_frames - 1:].detach()
-                if flow_standardize_latents:
-                    euler_ctx_norm = self.latent_rms.normalize(euler_ctx)
-                    euler_pred_norm = self.dynamics_flow.generate(
-                        euler_ctx_norm, euler_act, cfg_scale=flow_cfg_scale
-                    )  # (B, H, D)
-                    euler_pred = self.latent_rms.denormalize(euler_pred_norm)
-                else:
-                    euler_pred = self.dynamics_flow.generate(
-                        euler_ctx, euler_act, cfg_scale=flow_cfg_scale
-                    )  # (B, H, D)
-                # Pad to full T_act length for visualization / loss
-                if flow_ctx_frames > 1:
-                    euler_full = torch.cat([current_states[:, 1:flow_ctx_frames], euler_pred], dim=1)
-                else:
-                    euler_full = euler_pred
-                euler_full = euler_full[:, :T_act]
+                if run_flow:
+                    euler_ctx = current_states[:, :flow_ctx_frames].detach()
+                    euler_act = action_embedding[:, flow_ctx_frames - 1:].detach()
+                    if flow_standardize_latents:
+                        euler_ctx_norm = self.latent_rms.normalize(euler_ctx)
+                        euler_pred_norm = self.dynamics_flow.generate(
+                            euler_ctx_norm, euler_act, cfg_scale=flow_cfg_scale
+                        )  # (B, H, D)
+                        euler_pred = self.latent_rms.denormalize(euler_pred_norm)
+                    else:
+                        euler_pred = self.dynamics_flow.generate(
+                            euler_ctx, euler_act, cfg_scale=flow_cfg_scale
+                        )  # (B, H, D)
+                    # Pad to full T_act length for visualization / loss
+                    if flow_ctx_frames > 1:
+                        euler_full = torch.cat([current_states[:, 1:flow_ctx_frames], euler_pred], dim=1)
+                    else:
+                        euler_full = euler_pred
+                    euler_full = euler_full[:, :T_act]
 
-        return states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss, euler_full
+                # Open-loop AR predictions (fair comparison with flow matching)
+                ar_open_loop = []
+                curr_seq = current_states[:, :flow_ctx_frames].detach()
+                for i in range(T_act - flow_ctx_frames + 1):
+                    act_seq = action_embedding[:, :flow_ctx_frames + i].detach()
+                    pred = self.dynamics_ar(curr_seq, act_seq)
+                    next_state = pred[:, -1:]
+                    ar_open_loop.append(next_state)
+                    curr_seq = torch.cat([curr_seq, next_state], dim=1)
+                ar_open_loop_states = torch.cat(ar_open_loop, dim=1)
+                if flow_ctx_frames > 1:
+                    ar_full = torch.cat([current_states[:, 1:flow_ctx_frames], ar_open_loop_states], dim=1)
+                else:
+                    ar_full = ar_open_loop_states
+                ar_full = ar_full[:, :T_act]
+
+        return states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss, euler_full, ar_full
 
     def reset_cache(self):
         """Clears the KV cache before a new sequence rollout."""
@@ -258,16 +280,17 @@ class World(nn.Module):
 
         return self.latest_state, reward, terminal
 
-    def generate_chunk(self, actions, start_states, flow_standardize_latents=True, flow_cfg_scale=1.0):
+    def generate_chunk(self, actions, start_states, flow_standardize_latents=True, flow_cfg_scale=1.0, imagination_mode='flow'):
         '''
-        Parallel chunk generation via flow matching Euler integration.
-        Fully differentiable — gradients flow through all Euler steps.
+        Chunk generation via either flow matching Euler integration or autoregressive rollout.
+        Fully differentiable — gradients flow through the rollout/ODE steps.
         Used for actor imagination / training.
 
         actions: (B, T_act, Action space) - where T_act = ctx - 1 + chunk_size
         start_states: (B, ctx, Latent)
         flow_standardize_latents: bool — whether to standardize inputs to the flow model
         flow_cfg_scale: float — scale for Classifier-Free Guidance (CFG)
+        imagination_mode: str — 'flow' or 'ar'
         
         Returns:
             all_states_seq: (chunk_size + 1, B, D)  — includes start state
@@ -280,26 +303,42 @@ class World(nn.Module):
         ctx = start_states.size(1)
         chunk_size = T_act - ctx + 1
         
-        # actions layout: [ctx-1 context transition actions | chunk_size future actions]
-        future_action_emb = action_embedding[:, ctx - 1:]  # (B, chunk_size, act_dim)
-        
-        # Flow matching: generate chunk_size future states from context
-        if flow_standardize_latents:
-            ctx_states_norm = self.latent_rms.normalize(start_states)
-            imagined_states_norm = self.dynamics_flow.generate(
-                ctx_states=ctx_states_norm,
-                future_action_emb=future_action_emb,
-                num_steps=self.dynamics_flow.num_euler_steps,
-                cfg_scale=flow_cfg_scale,
-            )  # (B, chunk_size, D)
-            imagined_states = self.latent_rms.denormalize(imagined_states_norm)
+        if imagination_mode == 'flow':
+            # actions layout: [ctx-1 context transition actions | chunk_size future actions]
+            future_action_emb = action_embedding[:, ctx - 1:]  # (B, chunk_size, act_dim)
+            
+            # Flow matching: generate chunk_size future states from context
+            if flow_standardize_latents:
+                ctx_states_norm = self.latent_rms.normalize(start_states)
+                imagined_states_norm = self.dynamics_flow.generate(
+                    ctx_states=ctx_states_norm,
+                    future_action_emb=future_action_emb,
+                    num_steps=self.dynamics_flow.num_euler_steps,
+                    cfg_scale=flow_cfg_scale,
+                )  # (B, chunk_size, D)
+                imagined_states = self.latent_rms.denormalize(imagined_states_norm)
+            else:
+                imagined_states = self.dynamics_flow.generate(
+                    ctx_states=start_states,
+                    future_action_emb=future_action_emb,
+                    num_steps=self.dynamics_flow.num_euler_steps,
+                    cfg_scale=flow_cfg_scale,
+                )  # (B, chunk_size, D)
+        elif imagination_mode == 'ar':
+            # Autoregressive: generate chunk_size future states step-by-step
+            imagined_states_list = []
+            curr_seq = start_states.clone()
+            
+            for i in range(chunk_size):
+                act_seq = action_embedding[:, :ctx + i]
+                pred = self.dynamics_ar(curr_seq, act_seq)
+                next_state = pred[:, -1:]  # (B, 1, D)
+                imagined_states_list.append(next_state)
+                curr_seq = torch.cat([curr_seq, next_state], dim=1)
+                
+            imagined_states = torch.cat(imagined_states_list, dim=1)  # (B, chunk_size, D)
         else:
-            imagined_states = self.dynamics_flow.generate(
-                ctx_states=start_states,
-                future_action_emb=future_action_emb,
-                num_steps=self.dynamics_flow.num_euler_steps,
-                cfg_scale=flow_cfg_scale,
-            )  # (B, chunk_size, D)
+            raise ValueError(f"Unknown imagination mode: {imagination_mode}")
         
         # Prepend the starting state to get chunk_size + 1 states
         all_states = torch.cat([start_states[:, -1:], imagined_states], dim=1)  # (B, chunk_size + 1, D)
@@ -400,7 +439,7 @@ if __name__ == "__main__":
 
         world_optimizer.zero_grad()
         
-        states, target_latents, pred_latents, pred_rewards, pred_terminals, vel_loss, _ = world(
+        states, target_latents, pred_latents, pred_rewards, pred_terminals, vel_loss, _, _ = world(
             batch_actions, batch_obs, ctx_frames=ctx_frames
         )
         

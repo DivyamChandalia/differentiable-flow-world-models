@@ -60,8 +60,8 @@ class GradientFlowAnalyzer:
         ax.legend()
         fig.tight_layout()
         fig.savefig(os.path.join(save_dir, 'actor_grad_norms.png'), dpi=150)
-        plt.close(fig)
         print(f"Gradient norms plot saved to {save_dir}")
+        return fig
 
     # ------------------------------------------------------------------
     # Gradient cosine similarity
@@ -233,5 +233,5 @@ class GradientFlowAnalyzer:
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(os.path.join(save_dir, 'finite_diff_check.png'), dpi=150)
-        plt.close(fig)
         print(f"Finite difference comparison saved to {save_dir}")
+        return fig

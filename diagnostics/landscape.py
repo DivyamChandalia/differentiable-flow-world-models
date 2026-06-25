@@ -365,11 +365,12 @@ class LossLandscapeVisualizer:
         betas = landscape_data['betas']
         A, B = np.meshgrid(alphas, betas, indexing='ij')
 
+        figs = {}
         for name, grid in [('total_loss', landscape_data['total_loss']),
                            ('target_loss', landscape_data['target_loss']),
                            ('entropy_loss', landscape_data['entropy_loss'])]:
             # 2D contour
-            fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+            fig_contour, ax = plt.subplots(1, 1, figsize=(8, 7))
             cf = ax.contourf(A, B, grid, levels=30, cmap='RdYlBu_r')
             ax.contour(A, B, grid, levels=30, colors='k', linewidths=0.3, alpha=0.5)
             ax.plot(0, 0, 'r*', markersize=15, label='Current params')
@@ -378,13 +379,13 @@ class LossLandscapeVisualizer:
             ax.set_ylabel('Direction 2 (β)')
             ax.set_title(f'Actor {name.replace("_", " ").title()} Landscape')
             ax.legend()
-            fig.tight_layout()
-            fig.savefig(os.path.join(save_dir, f'landscape_{name}.png'), dpi=150)
-            plt.close(fig)
+            fig_contour.tight_layout()
+            fig_contour.savefig(os.path.join(save_dir, f'landscape_{name}.png'), dpi=150)
+            figs[f'{name}_contour'] = fig_contour
 
             # 3D surface
-            fig = plt.figure(figsize=(10, 8))
-            ax3d = fig.add_subplot(111, projection='3d')
+            fig_surf = plt.figure(figsize=(10, 8))
+            ax3d = fig_surf.add_subplot(111, projection='3d')
             ax3d.plot_surface(A, B, grid, cmap='RdYlBu_r', alpha=0.8, edgecolor='k', linewidth=0.1)
             ax3d.scatter([0], [0], [grid[len(alphas)//2, len(betas)//2]],
                          color='red', s=100, zorder=5, label='Current params')
@@ -392,17 +393,18 @@ class LossLandscapeVisualizer:
             ax3d.set_ylabel('Direction 2 (β)')
             ax3d.set_zlabel('Loss')
             ax3d.set_title(f'Actor {name.replace("_", " ").title()} Surface')
-            fig.tight_layout()
-            fig.savefig(os.path.join(save_dir, f'surface_{name}.png'), dpi=150)
-            plt.close(fig)
+            fig_surf.tight_layout()
+            fig_surf.savefig(os.path.join(save_dir, f'surface_{name}.png'), dpi=150)
+            figs[f'{name}_surface'] = fig_surf
 
         print(f"Landscape plots saved to {save_dir}")
+        return figs
 
     def plot_gradient_slice(self, slice_data, save_dir='./diagnostics_output'):
         """Plot the 1D loss curve along the gradient direction."""
         if slice_data is None:
             print("No gradient slice data to plot.")
-            return
+            return None
 
         os.makedirs(save_dir, exist_ok=True)
 
@@ -416,5 +418,6 @@ class LossLandscapeVisualizer:
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(os.path.join(save_dir, 'gradient_slice.png'), dpi=150)
-        plt.close(fig)
         print(f"Gradient slice plot saved to {save_dir}")
+        return fig
+

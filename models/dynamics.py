@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .common import ConditionalTransformer, SinusoidalTimeEmbedding
+from .common import ConditionalTransformer, SinusoidalTimeEmbedding, FutureFlowBlock, precompute_freqs_cis
 
 try:
     from torchdiffeq import odeint, odeint_adjoint
@@ -33,6 +33,7 @@ class Dynamics(nn.Module):
         num_heads,
         dropout=0.0,
         causal=True,
+        block_type='adaln',
     ):
         super().__init__()
         self.transformer = ConditionalTransformer(
@@ -42,6 +43,7 @@ class Dynamics(nn.Module):
             cond_dim=action_dim,
             seq_len=max_frames,
             causal=causal,
+            block_type=block_type,
         )
         self.horizon = max_frames
 
@@ -54,9 +56,9 @@ class Dynamics(nn.Module):
         res = self.transformer(x, c, kv_cache=kv_cache)
         if kv_cache is not None:
             out, new_kv_cache = res
-            return x + out, new_kv_cache
+            return out, new_kv_cache
         else:
-            return x + res
+            return res
 
 
 class ODEFuncWrapper(nn.Module):
@@ -90,22 +92,15 @@ class FlowMatchingDynamics(nn.Module):
     known context state to each future target state in parallel.  The ODE
     interpolates from t=0 (source = last context state + noise) to t=1
     (predicted/target states) using Euler steps.  The entire solve is
-    differentiable, enabling analytical gradients for actor training.
+    differentiable, enabling actor training gradients.
 
-    Key design decisions vs. the previous version:
-      • Input projection fuses [z_t, action_emb, t_emb] → hidden_dim so
-        each future position has unique content from the very first layer.
-      • A dedicated velocity head (MLP) maps transformer output → velocity
-        without being gated by AdaLN — avoids zero-init gate starvation.
-      • Source noise (σ = 0.25 by default) breaks the symmetry of identical
-        broadcast source states across the prediction horizon.
-      • Uniform time sampling t ~ U(0, 1) avoids the bias of logit-normal.
-
-    Training:
-        loss = model(ctx_states, action_emb, target_states, source_states)
-
-    Inference (imagination):
-        pred_states = model.generate(ctx_states, action_emb)
+    New Architecture:
+      - Noisy future latents are projected to model dim and conditioned with positional
+        embeddings and per-step future actions.
+      - Past context states are projected, augmented with positional embeddings, and
+        conditioned via cross-attention from future tokens.
+      - Global conditioning (flow time, pooled action, pooled context) modulates blocks
+        using AdaLN-Zero.
     """
 
     def __init__(
@@ -135,56 +130,40 @@ class FlowMatchingDynamics(nn.Module):
         self.atol = atol
         self.horizon = max_frames
 
-        # ── Input projection ────────────────────────────────────────────
-        # Fuses [z_t ‖ action_emb ‖ t_emb] → hidden_dim so each future
-        # position has unique content before the transformer sees it.
-        self.input_proj = nn.Sequential(
-            nn.Linear(hidden_dim + action_dim + hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        # Learnable position embedding for future tokens — breaks symmetry
-        # when all positions start from the same broadcast source state.
-        self.horizon_pos_embed = nn.Parameter(torch.zeros(1, max_frames, hidden_dim))
-        nn.init.normal_(self.horizon_pos_embed, std=0.02)
+        # ── Input projections & Positional Embeddings ───────────────────
+        self.proj_x = nn.Linear(hidden_dim, hidden_dim)
+        self.proj_past = nn.Linear(hidden_dim, hidden_dim)
+        self.action_proj = nn.Linear(action_dim, hidden_dim)
+        
+        # Learnable positional embeddings for past and future tokens
+        self.past_pos_embed = nn.Parameter(torch.zeros(1, max_frames, hidden_dim))
+        self.future_pos_embed = nn.Parameter(torch.zeros(1, max_frames, hidden_dim))
+        nn.init.normal_(self.past_pos_embed, std=0.02)
+        nn.init.normal_(self.future_pos_embed, std=0.02)
 
         # ── Time embedding ──────────────────────────────────────────────
         self.time_embed = SinusoidalTimeEmbedding(hidden_dim)
 
-        # ── Additive conditioning ───────────────────────────────────────
-        # Fuse action + time into a conditioning vector for explicit
-        # additive injection at each transformer layer.
-        self.cond_proj = nn.Sequential(
-            nn.Linear(action_dim + hidden_dim, action_dim),
-            nn.SiLU(),
-            nn.Linear(action_dim, action_dim),
-        )
-
-        # Learnable conditioning token for context positions
-        # (context states are clean — they don't need action conditioning,
-        #  but the transformer requires a conditioning vector per position)
-        self.ctx_cond_token = nn.Parameter(torch.zeros(1, 1, action_dim))
-        nn.init.normal_(self.ctx_cond_token, std=0.02)
+        # ── Global condition projections ────────────────────────────────
+        self.pooled_action_proj = nn.Linear(action_dim, hidden_dim)
+        self.pooled_context_proj = nn.Linear(hidden_dim, hidden_dim)
 
         # Learnable null context token for Classifier-Free Guidance (CFG)
         self.null_ctx_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         nn.init.normal_(self.null_ctx_token, std=0.02)
 
-        # ── Velocity network backbone (additive conditioning) ──────────
-        self.velocity_net = ConditionalTransformer(
-            depth=num_layers,
-            dim=hidden_dim,
-            num_heads=num_heads,
-            cond_dim=action_dim,
-            seq_len=max_frames,
-            causal=causal,
-            block_type='additive',
-        )
+        # Precompute rotary frequency tensor for self-attention
+        self.head_dim = hidden_dim // num_heads
+        freqs_cis = precompute_freqs_cis(self.head_dim, max_frames)
+        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+
+        # ── Transformer backbone (AdaLN / Cross-Attention Blocks) ───────
+        self.blocks = nn.ModuleList([
+            FutureFlowBlock(hidden_dim, num_heads, cond_dim=hidden_dim)
+            for _ in range(num_layers)
+        ])
 
         # ── Velocity output head ────────────────────────────────────────
-        # Dedicated MLP that maps transformer output → velocity.
-        # NOT gated by AdaLN — produces non-trivial output from init.
         self.velocity_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -205,11 +184,8 @@ class FlowMatchingDynamics(nn.Module):
         Args:
             z_t:               (B, H, D)          interpolated future states
             t:                 (B,) or (B, H)     flow timestep in [0, 1]
-                               (B,) during Euler inference — same t for all positions.
-                               (B, H) during training — per-position t sampling.
-            ctx_states:        (B, C, D)           real context frames (clean)
-            future_action_emb: (B, H, action_dim)  action embeddings for
-                               predicted future steps
+            ctx_states:        (B, C, D)          real context frames (clean)
+            future_action_emb: (B, H, action_dim) action embeddings for predicted future steps
             drop_ctx:          None, bool, or Tensor of shape (B,) indicating which
                                samples in the batch have dropped context.
 
@@ -230,42 +206,36 @@ class FlowMatchingDynamics(nn.Module):
                 mask = drop_ctx.view(B, 1, 1)
                 ctx_states = torch.where(mask, null_ctx, ctx_states)
 
-        # ── Per-position time embedding ─────────────────────────────────
-        # Handle both (B,) shared time and (B, H) per-position time.
-        if t.dim() == 1:
-            # Euler inference: same t for all positions → broadcast
-            t_expanded = t.unsqueeze(1).expand(-1, H)  # (B, H)
+        # 1. Project noisy future latents to model dim & add position/action embeddings
+        future = self.proj_x(z_t) + self.future_pos_embed[:, :H, :]
+        future = future + self.action_proj(future_action_emb)
+
+        # 2. Project past context & add position embeddings
+        past = self.proj_past(ctx_states) + self.past_pos_embed[:, :C, :]
+
+        # 3. Compute global conditioning: time_embed(tau) + pooled_actions + pooled_context
+        if t.dim() == 2:
+            # Pool/average time if it is per-position
+            t_global = t.mean(dim=1)
         else:
-            t_expanded = t  # already (B, H)
+            t_global = t
+        
+        global_cond = self.time_embed(t_global)
+        
+        # Add pooled action summary and pooled context summary to global conditioning
+        pooled_action = future_action_emb.mean(dim=1)  # (B, action_dim)
+        pooled_context = ctx_states.mean(dim=1)        # (B, D)
+        global_cond = global_cond + self.pooled_action_proj(pooled_action) + self.pooled_context_proj(pooled_context)
 
-        # Embed each position's time independently
-        t_flat = t_expanded.reshape(-1)                      # (B*H,)
-        t_emb = self.time_embed(t_flat).reshape(B, H, -1)    # (B, H, hidden_dim)
+        # 4. Process future tokens through transformer blocks
+        # Retrieve rotary positional frequencies for self-attention
+        freqs_cis = self.freqs_cis[:H]
 
-        # ── Build per-position future input ─────────────────────────────
-        # Fuse [z_t ‖ action_emb ‖ t_emb] → hidden_dim
-        future_input = torch.cat([z_t, future_action_emb, t_emb], dim=-1)
-        future_tokens = self.input_proj(future_input)  # (B, H, hidden_dim)
+        for block in self.blocks:
+            future = block(future, past, global_cond, freqs_cis=freqs_cis)
 
-        # Add horizon positional embeddings
-        future_tokens = future_tokens + self.horizon_pos_embed[:, :H, :]
-
-        # ── Concat context + future → transformer ──────────────────────
-        x = torch.cat([ctx_states, future_tokens], dim=1)  # (B, C + H, D)
-
-        # ── Additive conditioning ──────────────────────────────────────
-        cond_input = torch.cat([future_action_emb, t_emb], dim=-1)
-        future_cond = self.cond_proj(cond_input)  # (B, H, action_dim)
-
-        ctx_cond = self.ctx_cond_token.expand(B, C, -1)  # (B, C, action_dim)
-        cond = torch.cat([ctx_cond, future_cond], dim=1)  # (B, C + H, action_dim)
-
-        # ── Transformer backbone ────────────────────────────────────────
-        out = self.velocity_net(x, cond, kv_cache=None)  # (B, C + H, D)
-
-        # ── Velocity head (future positions only) ──────────────────────
-        future_out = out[:, C:]  # (B, H, D)
-        velocity = self.velocity_head(future_out)  # (B, H, D)
+        # 5. Output velocity
+        velocity = self.velocity_head(future)
 
         return velocity
 

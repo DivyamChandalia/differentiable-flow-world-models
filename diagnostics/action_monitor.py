@@ -106,7 +106,7 @@ class ActionDistributionMonitor:
         steps = np.arange(H)
 
         # --- Plot 1: Saturation indicators ---
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig_health, axes = plt.subplots(2, 2, figsize=(14, 10))
 
         ax = axes[0, 0]
         ax.plot(steps, stats['pre_tanh_mean_abs'], 'b-o', markersize=4)
@@ -140,13 +140,12 @@ class ActionDistributionMonitor:
         ax.set_title('Analytical Entropy Over Horizon')
         ax.grid(True, alpha=0.3)
 
-        fig.suptitle('Action Distribution Health', fontsize=14, fontweight='bold')
-        fig.tight_layout()
-        fig.savefig(os.path.join(save_dir, 'action_distribution_health.png'), dpi=150)
-        plt.close(fig)
+        fig_health.suptitle('Action Distribution Health', fontsize=14, fontweight='bold')
+        fig_health.tight_layout()
+        fig_health.savefig(os.path.join(save_dir, 'action_distribution_health.png'), dpi=150)
 
         # --- Plot 2: Pre-tanh activation histogram ---
-        fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+        fig_hist, ax = plt.subplots(1, 1, figsize=(10, 5))
         samples_flat = stats['pre_tanh_samples'].flatten()
         ax.hist(samples_flat, bins=100, density=True, alpha=0.7, color='steelblue')
         ax.axvline(-2.0, color='red', linestyle='--', alpha=0.5)
@@ -156,16 +155,15 @@ class ActionDistributionMonitor:
         ax.set_title('Distribution of Pre-Tanh Activations (all steps)')
         ax.legend()
         ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(os.path.join(save_dir, 'pre_tanh_histogram.png'), dpi=150)
-        plt.close(fig)
+        fig_hist.tight_layout()
+        fig_hist.savefig(os.path.join(save_dir, 'pre_tanh_histogram.png'), dpi=150)
 
         # --- Plot 3: Per-dimension action means across horizon ---
         action_means = stats['action_means_per_dim']  # (H, action_dim)
         action_stds = stats['action_stds_per_dim']
         n_actions = action_means.shape[1]
 
-        fig, axes = plt.subplots(1, n_actions, figsize=(5 * n_actions, 4), squeeze=False)
+        fig_profile, axes = plt.subplots(1, n_actions, figsize=(5 * n_actions, 4), squeeze=False)
         for d in range(n_actions):
             ax = axes[0, d]
             ax.plot(steps, action_means[:, d], 'b-o', markersize=4, label='Mean')
@@ -179,9 +177,10 @@ class ActionDistributionMonitor:
             ax.legend()
             ax.grid(True, alpha=0.3)
 
-        fig.suptitle('Per-Dimension Action Profile', fontsize=14, fontweight='bold')
-        fig.tight_layout()
-        fig.savefig(os.path.join(save_dir, 'action_profile_per_dim.png'), dpi=150)
-        plt.close(fig)
+        fig_profile.suptitle('Per-Dimension Action Profile', fontsize=14, fontweight='bold')
+        fig_profile.tight_layout()
+        fig_profile.savefig(os.path.join(save_dir, 'action_profile_per_dim.png'), dpi=150)
 
         print(f"Action distribution plots saved to {save_dir}")
+        return fig_health, fig_hist, fig_profile
+
