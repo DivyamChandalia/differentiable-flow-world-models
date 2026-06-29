@@ -131,10 +131,13 @@ class DMCGym(gym.Env):
         
         # 2. Frame skip and reward accumulation
         total_reward = 0.0
+        terminated = False
         for _ in range(self._frame_skip):
             timestep = self._env.step(action)
             total_reward += (timestep.reward or 0.0)
-            if timestep.last():
+            if self._domain == 'cartpole' and abs(self._env.physics.cart_position()) >= 1.8:
+                terminated = True
+            if timestep.last() or terminated:
                 break
         
         # 3. Process Observations
@@ -142,9 +145,7 @@ class DMCGym(gym.Env):
         self.current_state = _flatten_obs(timestep.observation)
         
         # 4. Gymnasium returns
-        terminated = False
-                
-        truncated = timestep.last()
+        truncated = timestep.last() and not terminated
         info = {
             "internal_state": self._env.physics.get_state().copy(),
             "discount": timestep.discount,

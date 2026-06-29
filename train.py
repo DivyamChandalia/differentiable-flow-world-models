@@ -94,7 +94,7 @@ class Config:
     actor_num_blocks: int = 4
     value_num_blocks: int = 4
     use_symlog: bool = True
-    use_termination: bool = False        # Whether to use the termination head
+    use_termination: bool = True        # Whether to use the termination head
 
     beta_real_value: float = 1.0
     beta_imag_value: float = 1.0
