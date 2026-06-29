@@ -47,6 +47,7 @@ class DMCGym(gym.Env):
         frame_skip=4,
         channels_first=True,
         rendering="egl",
+        terminate_on_limit=True,
     ):
         os.environ["MUJOCO_GL"] = rendering
         task_kwargs = task_kwargs or {}
@@ -58,6 +59,7 @@ class DMCGym(gym.Env):
         self._domain = domain
         self._from_pixels = from_pixels
         self._normalize_actions = normalize_actions
+        self._terminate_on_limit = terminate_on_limit
         self._height = height
         self._width = width
         self._camera_id = camera_id
@@ -135,7 +137,7 @@ class DMCGym(gym.Env):
         for _ in range(self._frame_skip):
             timestep = self._env.step(action)
             total_reward += (timestep.reward or 0.0)
-            if self._domain == 'cartpole' and abs(self._env.physics.cart_position()) >= 1.8:
+            if self._terminate_on_limit and self._domain == 'cartpole' and abs(self._env.physics.cart_position()) >= 1.8:
                 terminated = True
             if timestep.last() or terminated:
                 break

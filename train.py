@@ -95,6 +95,8 @@ class Config:
     value_num_blocks: int = 4
     use_symlog: bool = True
     use_termination: bool = True        # Whether to use the termination head
+    env_terminate_on_limit: bool = True  # Whether to terminate Cartpole episodes when hitting track limits
+    freeze_world: bool = False           # Whether to freeze the world model after bootstrapping
 
     beta_real_value: float = 1.0
     beta_imag_value: float = 1.0
@@ -213,13 +215,28 @@ class Trainer:
         self.set_seed(cfg.seed)
         
         env_fns = [
-            partial(make_env, cfg.domain, cfg.task, cfg.seed + i, cfg.image_size, cfg.image_size) 
+            partial(
+                make_env, 
+                cfg.domain, 
+                cfg.task, 
+                cfg.seed + i, 
+                cfg.image_size, 
+                cfg.image_size,
+                terminate_on_limit=cfg.env_terminate_on_limit
+            ) 
             for i in range(cfg.num_envs)
         ]
         self.envs = SubprocVecEnv(env_fns)
         self.action_dim = self.envs.get_action_space().shape[0]
         
-        self.val_env = make_env(cfg.domain, cfg.task, cfg.seed * 100, cfg.image_size, cfg.image_size)
+        self.val_env = make_env(
+            cfg.domain, 
+            cfg.task, 
+            cfg.seed * 100, 
+            cfg.image_size, 
+            cfg.image_size,
+            terminate_on_limit=cfg.env_terminate_on_limit
+        )
         
         vision = VisionEncoder(latent_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         action_enc = ActionEncoder(action_space=self.envs.get_action_space(), hidden_dim=cfg.hidden_dim, output_dim=cfg.latent_dim)
@@ -554,7 +571,11 @@ class Trainer:
         else:
             sym_rew_batch = rew_batch
         
-        self.world.unfreeze()
+        is_wm_frozen = self.cfg.freeze_world and (self.world_step >= self.cfg.world_bootstrap_steps)
+        if is_wm_frozen:
+            self.world.freeze()
+        else:
+            self.world.unfreeze()
         self.value_model.train()
         
         log_recon = self.cfg.recon_debug and (self.world_step % self.cfg.train_steps == 0)
@@ -816,7 +837,7 @@ class Trainer:
         scale_factor = self.scaler.get_scale()
         
         # AR Dynamics Loss
-        if 'ar' in self.cfg.world_backend:
+        if not is_wm_frozen and 'ar' in self.cfg.world_backend:
             self.world_opt.zero_grad(set_to_none=True)
             self.scaler.scale(ar_dyn_loss).backward(retain_graph=True)
             ar_dyn_grad_norm = self._compute_grad_norm(self.world) / scale_factor
@@ -824,7 +845,7 @@ class Trainer:
             ar_dyn_grad_norm = 0.0
             
         # Flow Velocity Loss
-        if 'flow' in self.cfg.world_backend:
+        if not is_wm_frozen and 'flow' in self.cfg.world_backend:
             self.world_opt.zero_grad(set_to_none=True)
             self.scaler.scale(flow_loss).backward(retain_graph=True)
             flow_grad_norm = self._compute_grad_norm(self.world) / scale_factor
@@ -832,12 +853,15 @@ class Trainer:
             flow_grad_norm = 0.0
             
         # Reward Loss
-        self.world_opt.zero_grad(set_to_none=True)
-        self.scaler.scale(rew_loss).backward(retain_graph=True)
-        rew_grad_norm = self._compute_grad_norm(self.world) / scale_factor
-        
+        if not is_wm_frozen:
+            self.world_opt.zero_grad(set_to_none=True)
+            self.scaler.scale(rew_loss).backward(retain_graph=True)
+            rew_grad_norm = self._compute_grad_norm(self.world) / scale_factor
+        else:
+            rew_grad_norm = 0.0
+            
         # Termination Loss
-        if self.cfg.use_termination:
+        if not is_wm_frozen and self.cfg.use_termination:
             self.world_opt.zero_grad(set_to_none=True)
             self.scaler.scale(term_loss).backward(retain_graph=True)
             term_grad_norm = self._compute_grad_norm(self.world) / scale_factor
@@ -845,7 +869,7 @@ class Trainer:
             term_grad_norm = 0.0
             
         # SIGReg Loss
-        if self.cfg.use_sigreg:
+        if not is_wm_frozen and self.cfg.use_sigreg:
             self.world_opt.zero_grad(set_to_none=True)
             self.scaler.scale(self.cfg.sigreg_weight * sig_loss).backward(retain_graph=True)
             sig_grad_norm = self._compute_grad_norm(self.world) / scale_factor
@@ -853,7 +877,7 @@ class Trainer:
             sig_grad_norm = 0.0
             
         # Reconstruction Loss
-        if self.cfg.recon_debug:
+        if not is_wm_frozen and self.cfg.recon_debug:
             self.world_opt.zero_grad(set_to_none=True)
             self.scaler.scale(total_recon_loss).backward(retain_graph=True)
             recon_grad_norm = self._compute_grad_norm(self.world) / scale_factor
@@ -866,21 +890,34 @@ class Trainer:
         v_grad_norm = self._compute_grad_norm(self.value_model) / scale_factor
             
         # Combined backward
-        self.world_opt.zero_grad(set_to_none=True)
-        self.value_opt.zero_grad(set_to_none=True)
-        
-        total_loss = wm_loss + v_loss
-        self.scaler.scale(total_loss).backward()
-        
-        self.scaler.unscale_(self.world_opt)
-        self.scaler.unscale_(self.value_opt)
-        grad_norm = self._compute_grad_norm(self.world)
-        torch.nn.utils.clip_grad_norm_(self.world.parameters(), self.cfg.grad_clip_norm)
-        torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.cfg.grad_clip_norm)
-        
-        self.scaler.step(self.world_opt)
-        self.scaler.step(self.value_opt)
-        self.scaler.update()
+        if not is_wm_frozen:
+            self.world_opt.zero_grad(set_to_none=True)
+            self.value_opt.zero_grad(set_to_none=True)
+            
+            total_loss = wm_loss + v_loss
+            self.scaler.scale(total_loss).backward()
+            
+            self.scaler.unscale_(self.world_opt)
+            self.scaler.unscale_(self.value_opt)
+            grad_norm = self._compute_grad_norm(self.world)
+            torch.nn.utils.clip_grad_norm_(self.world.parameters(), self.cfg.grad_clip_norm)
+            torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.cfg.grad_clip_norm)
+            
+            self.scaler.step(self.world_opt)
+            self.scaler.step(self.value_opt)
+            self.scaler.update()
+        else:
+            self.value_opt.zero_grad(set_to_none=True)
+            
+            total_loss = wm_loss + v_loss
+            self.scaler.scale(v_loss).backward()
+            
+            self.scaler.unscale_(self.value_opt)
+            grad_norm = 0.0
+            torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.cfg.grad_clip_norm)
+            
+            self.scaler.step(self.value_opt)
+            self.scaler.update()
         
         self.update_value_target()
         

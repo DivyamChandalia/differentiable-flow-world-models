@@ -99,7 +99,15 @@ class SubprocVecEnv:
             p.join()
         self.closed = True
 
-def make_env(domain, task, seed, height, width):
+def make_env(domain, task, seed, height, width, terminate_on_limit=True):
     """Top-level function for pickling safely across OSs."""
     camera_id = 1 if domain == 'cartpole' else 0
-    return DMCGym(domain=domain, task=task, task_kwargs={'random': seed}, height=height, width=width, camera_id=camera_id)
+    return DMCGym(
+        domain=domain,
+        task=task,
+        task_kwargs={'random': seed},
+        height=height,
+        width=width,
+        camera_id=camera_id,
+        terminate_on_limit=terminate_on_limit
+    )
