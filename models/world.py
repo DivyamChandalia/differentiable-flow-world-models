@@ -41,10 +41,8 @@ class RunningMeanStd(nn.Module):
     def denormalize(self, x):
         std = torch.sqrt(self.var + self.epsilon)
         return x * std + self.mean
-
-
 class World(nn.Module):
-    def __init__(self, vision, dynamics_ar, dynamics_flow, action, reward, termination, horizon=15, decoder=None):
+    def __init__(self, vision, dynamics_ar, dynamics_flow, action, reward, termination=None, horizon=15, decoder=None):
         """Dual-dynamics world model.
 
         Args:
@@ -75,9 +73,9 @@ class World(nn.Module):
         self.latest_state = None
 
     def forward(self, actions, observations, ctx_frames=None, run_euler=False,
-                flow_detach_encoder=True, flow_distill_from_ar=False,
+                flow_distill_from_ar=False,
                 flow_standardize_latents=True, flow_cfg_dropout=0.0,
-                flow_cfg_scale=1.0, run_flow=True):
+                flow_cfg_scale=1.0, run_flow=True, world_training=('flow', 'ar')):
         '''
         Training forward pass with dual dynamics.
 
@@ -96,20 +94,23 @@ class World(nn.Module):
             observations:        (B, T, C, H, W)
             ctx_frames:          int — number of real frames used as context
             run_euler:           bool — compute Euler predicted states for visualization
-            flow_detach_encoder: bool — if True, stop-grad encoder outputs for flow model
             flow_distill_from_ar: bool — if True, flow model trains on AR predictions
                                          instead of encoder outputs
             flow_standardize_latents: bool — if True, standardize latents for flow matching
             run_flow:            bool — if True, run flow matching forward and compute loss
+            world_training:      tuple/list — backends active for training reward/termination heads
 
         Returns:
             states:            (B, T, D)     all encoded states
             target_state:      (B, T-1, D)   ground-truth next states (encoder outputs)
-            pred_next_state:   (B, T-1, D)   autoregressive predicted states
-            pred_rewards:      (B, T-1, 1)   predicted rewards (from AR predictions)
-            pred_terminals:    (B, T-1, 1)   predicted terminals (from AR predictions)
+            pred_next_state:   (B, T-1, D)   autoregressive predicted states (or None)
+            pred_rewards:      (B, T-1, 1)   predicted rewards from AR predictions (or None)
+            pred_terminals:    (B, T-1, 1)   predicted terminals from AR / target states
             velocity_loss:     scalar         CFM velocity matching loss
             euler_full:        (B, T-1, D)   Euler-predicted states (or None)
+            ar_full:           (B, T-1, D)   AR open-loop states (or None)
+            pred_rewards_flow: (B, H, 1)     flow model reward predictions (or None)
+            pred_terminals_flow:(B, H, 1)    flow model terminal predictions (or None)
         '''
 
         B, T_act, AS = actions.shape
@@ -128,35 +129,44 @@ class World(nn.Module):
 
         # =====================================================================
         # Autoregressive dynamics — teacher-forced training
-        # With causal attention, position i sees states 0..i and predicts
-        # state i+1 via the residual: pred[i] = current_states[i] + transformer_out[i]
-        # No placeholders needed — the causal mask prevents future leakage.
         # =====================================================================
-        pred_next_state = self.dynamics_ar(current_states, action_embedding)
-
-        # Reward/term heads train on autoregressive predictions — gradients
-        # flow through the dynamics model as per the user's request
-        pred_rewards = self.reward(pred_next_state)
-        pred_terminals = self.termination(pred_next_state)
+        if self.dynamics_ar is not None:
+            pred_next_state = self.dynamics_ar(current_states, action_embedding)
+            pred_rewards = self.reward(pred_next_state)
+            if self.termination is not None:
+                pred_terminals = self.termination(pred_next_state)
+            else:
+                pred_terminals = torch.full((B, T_act, 1), -20.0, device=actions.device)
+        else:
+            pred_next_state = None
+            pred_rewards = None
+            if self.termination is not None:
+                pred_terminals = self.termination(target_state)
+            else:
+                pred_terminals = torch.full((B, T_act, 1), -20.0, device=actions.device)
 
         # =====================================================================
-        # Flow matching dynamics — velocity loss for the imagination model
+        # Flow matching dynamics — velocity loss & head prediction
         # =====================================================================
         flow_ctx_frames = ctx_frames if (ctx_frames is not None and ctx_frames < T_act) else 1
+        velocity_loss = torch.tensor(0.0, device=actions.device)
+        pred_rewards_flow = None
+        pred_terminals_flow = None
+        z_pred_flow = None
+        t = None
 
-        if run_flow:
+        if run_flow and self.dynamics_flow is not None:
             if flow_distill_from_ar:
-                # Train flow model to match AR predictions (distillation)
+                if pred_next_state is None:
+                    raise ValueError("flow_distill_from_ar requires AR model to be enabled.")
                 flow_future_targets = pred_next_state[:, flow_ctx_frames - 1:].detach()
             else:
-                # Train flow model on encoder outputs
                 flow_future_targets = target_state[:, flow_ctx_frames - 1:]
 
             flow_ctx_states = current_states[:, :flow_ctx_frames]
             flow_future_act = action_embedding[:, flow_ctx_frames - 1:]
 
-            if flow_detach_encoder:
-                # Stop-grad: flow model doesn't influence encoder learning
+            if 'flow' not in world_training:
                 flow_ctx_states = flow_ctx_states.detach()
                 flow_future_targets = flow_future_targets.detach()
                 flow_future_act = flow_future_act.detach()
@@ -164,20 +174,66 @@ class World(nn.Module):
             flow_source = flow_ctx_states[:, -1:].expand_as(flow_future_targets)
 
             if flow_standardize_latents:
-                flow_ctx_states_norm = self.latent_rms.normalize(flow_ctx_states)
-                flow_future_targets_norm = self.latent_rms.normalize(flow_future_targets)
-                flow_source_norm = self.latent_rms.normalize(flow_source)
-                velocity_loss = self.dynamics_flow(
-                    flow_ctx_states_norm, flow_future_act, flow_future_targets_norm, flow_source_norm,
-                    cfg_dropout=flow_cfg_dropout
-                )
+                ctx_in = self.latent_rms.normalize(flow_ctx_states)
+                targets_in = self.latent_rms.normalize(flow_future_targets)
+                source_in = self.latent_rms.normalize(flow_source)
             else:
-                velocity_loss = self.dynamics_flow(
-                    flow_ctx_states, flow_future_act, flow_future_targets, flow_source,
-                    cfg_dropout=flow_cfg_dropout
-                )
-        else:
-            velocity_loss = torch.tensor(0.0, device=actions.device)
+                ctx_in = flow_ctx_states
+                targets_in = flow_future_targets
+                source_in = flow_source
+
+            # Sample t for CFM
+            t = torch.rand(B, device=actions.device, dtype=ctx_in.dtype)
+            t_expanded = t.view(B, 1, 1)
+
+            if self.dynamics_flow.source_noise_sigma == 1.0:
+                z_0 = torch.randn_like(source_in)
+            elif self.dynamics_flow.source_noise_sigma == 0.0:
+                z_0 = source_in
+            else:
+                noise = torch.randn_like(source_in)
+                z_0 = source_in + self.dynamics_flow.source_noise_sigma * noise
+                if flow_standardize_latents:
+                    z_0 = z_0 / ((1.0 + self.dynamics_flow.source_noise_sigma ** 2) ** 0.5)
+
+            # Interpolate
+            z_t = (1.0 - t_expanded) * z_0 + t_expanded * targets_in
+            velocity_target = targets_in - z_0
+
+            if flow_cfg_dropout > 0.0:
+                drop_ctx = torch.rand(B, device=actions.device) < flow_cfg_dropout
+            else:
+                drop_ctx = None
+
+            # Predict velocity
+            velocity_pred = self.dynamics_flow.compute_velocity(
+                z_t, t, ctx_in, flow_future_act, drop_ctx=drop_ctx
+            )
+            velocity_loss = torch.nn.functional.mse_loss(velocity_pred, velocity_target)
+            if self.dynamics_flow.vel_cos_weight > 0.0:
+                loss_vel_cos = 1.0 - torch.nn.functional.cosine_similarity(
+                    velocity_pred.flatten(1),
+                    velocity_target.flatten(1),
+                    dim=-1
+                ).mean()
+                velocity_loss = velocity_loss + self.dynamics_flow.vel_cos_weight * loss_vel_cos
+
+            if 'flow' in world_training:
+                # Single-step Euler prediction for gradients backpropagation
+                # z_pred = z_t + (1 - t) * v_theta
+                z_pred_norm = z_t + (1.0 - t_expanded) * velocity_pred
+                if flow_standardize_latents:
+                    z_pred = self.latent_rms.denormalize(z_pred_norm)
+                else:
+                    z_pred = z_pred_norm
+
+                pred_rewards_flow = self.reward(z_pred.detach())
+                z_pred_flow = z_pred
+                if self.termination is not None:
+                    pred_terminals_flow = self.termination(z_pred.detach())
+                else:
+                    pred_terminals_flow = torch.full((B, z_pred.shape[1], 1), -20.0, device=actions.device)
+
 
         # =====================================================================
         # Euler solve for reconstruction visualization (optional, no grad)
@@ -186,7 +242,7 @@ class World(nn.Module):
         ar_full = None
         if run_euler:
             with torch.no_grad():
-                if run_flow:
+                if run_flow and self.dynamics_flow is not None:
                     euler_ctx = current_states[:, :flow_ctx_frames].detach()
                     euler_act = action_embedding[:, flow_ctx_frames - 1:].detach()
                     if flow_standardize_latents:
@@ -207,22 +263,28 @@ class World(nn.Module):
                     euler_full = euler_full[:, :T_act]
 
                 # Open-loop AR predictions (fair comparison with flow matching)
-                ar_open_loop = []
-                curr_seq = current_states[:, :flow_ctx_frames].detach()
-                for i in range(T_act - flow_ctx_frames + 1):
-                    act_seq = action_embedding[:, :flow_ctx_frames + i].detach()
-                    pred = self.dynamics_ar(curr_seq, act_seq)
-                    next_state = pred[:, -1:]
-                    ar_open_loop.append(next_state)
-                    curr_seq = torch.cat([curr_seq, next_state], dim=1)
-                ar_open_loop_states = torch.cat(ar_open_loop, dim=1)
-                if flow_ctx_frames > 1:
-                    ar_full = torch.cat([current_states[:, 1:flow_ctx_frames], ar_open_loop_states], dim=1)
-                else:
-                    ar_full = ar_open_loop_states
-                ar_full = ar_full[:, :T_act]
+                if self.dynamics_ar is not None:
+                    ar_open_loop = []
+                    curr_seq = current_states[:, :flow_ctx_frames].detach()
+                    for i in range(T_act - flow_ctx_frames + 1):
+                        act_seq = action_embedding[:, :flow_ctx_frames + i].detach()
+                        pred = self.dynamics_ar(curr_seq, act_seq)
+                        next_state = pred[:, -1:]
+                        ar_open_loop.append(next_state)
+                        curr_seq = torch.cat([curr_seq, next_state], dim=1)
+                    ar_open_loop_states = torch.cat(ar_open_loop, dim=1)
+                    if flow_ctx_frames > 1:
+                        ar_full = torch.cat([current_states[:, 1:flow_ctx_frames], ar_open_loop_states], dim=1)
+                    else:
+                        ar_full = ar_open_loop_states
+                    ar_full = ar_full[:, :T_act]
 
-        return states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss, euler_full, ar_full
+        return (
+            states, target_state, 
+            pred_next_state, pred_rewards, pred_terminals, 
+            velocity_loss, euler_full, ar_full,
+            pred_rewards_flow, pred_terminals_flow, t, z_pred_flow
+        )
 
     def reset_cache(self):
         """Clears the KV cache before a new sequence rollout."""
@@ -238,6 +300,9 @@ class World(nn.Module):
         start_observations: (B, T, C, H, W) - For environment rollouts
         start_states: (B, Seq, Latent) - For imagination rollouts
         '''
+        if self.dynamics_ar is None:
+            raise RuntimeError("step_world requires the autoregressive model to be enabled (active in world_backend).")
+
         action_embedding = self.action(actions)
 
         if self.current_kv_cache is None:
@@ -276,7 +341,10 @@ class World(nn.Module):
             self.latest_state = out_states[:, -1:]
 
         reward = self.reward(self.latest_state.squeeze(1))
-        terminal = self.termination(self.latest_state.squeeze(1))
+        if self.termination is not None:
+            terminal = self.termination(self.latest_state.squeeze(1))
+        else:
+            terminal = torch.full((B, 1), -20.0, device=self.latest_state.device)
 
         return self.latest_state, reward, terminal
 
@@ -304,6 +372,8 @@ class World(nn.Module):
         chunk_size = T_act - ctx + 1
         
         if imagination_mode == 'flow':
+            if self.dynamics_flow is None:
+                raise ValueError("Imagination mode 'flow' requires the flow model to be enabled (active in world_backend).")
             # actions layout: [ctx-1 context transition actions | chunk_size future actions]
             future_action_emb = action_embedding[:, ctx - 1:]  # (B, chunk_size, act_dim)
             
@@ -325,6 +395,8 @@ class World(nn.Module):
                     cfg_scale=flow_cfg_scale,
                 )  # (B, chunk_size, D)
         elif imagination_mode == 'ar':
+            if self.dynamics_ar is None:
+                raise ValueError("Imagination mode 'ar' requires the autoregressive model to be enabled (active in world_backend).")
             # Autoregressive: generate chunk_size future states step-by-step
             imagined_states_list = []
             curr_seq = start_states.clone()
@@ -349,7 +421,10 @@ class World(nn.Module):
         
         # Predict rewards and terminals
         rewards = self.reward(imagined_states_seq)       # (chunk_size, B, 1)
-        terminals = self.termination(imagined_states_seq) # (chunk_size, B, 1)
+        if self.termination is not None:
+            terminals = self.termination(imagined_states_seq) # (chunk_size, B, 1)
+        else:
+            terminals = torch.full((chunk_size, B, 1), -20.0, device=imagined_states_seq.device)
         
         return all_states_seq, rewards, terminals
 
@@ -402,6 +477,7 @@ if __name__ == "__main__":
         num_layers=6,
         num_heads=4,
         num_euler_steps=6,
+        vel_cos_weight=0.05,
     )
     
     reward = Reward(obs_dim=latent_dim, hidden_dim=hidden_dim)
@@ -439,7 +515,7 @@ if __name__ == "__main__":
 
         world_optimizer.zero_grad()
         
-        states, target_latents, pred_latents, pred_rewards, pred_terminals, vel_loss, _, _ = world(
+        states, target_latents, pred_latents, pred_rewards, pred_terminals, vel_loss, _, _, _, _, _, _ = world(
             batch_actions, batch_obs, ctx_frames=ctx_frames
         )
         

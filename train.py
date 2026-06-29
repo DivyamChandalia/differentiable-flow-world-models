@@ -41,22 +41,28 @@ class Config:
     dyn_block_type: str = 'adaln'
     
     # Flow matching dynamics (for actor imagination)
-    flow_num_layers: int = 6
+    flow_num_layers: int = 3
     flow_num_heads: int = 4
     flow_causal: bool = False   # Causal sequence mask: prevents future target leakage during training
-    flow_num_euler_steps: int = 6
-    flow_source_noise_sigma: float = 1.0
+    flow_num_euler_steps: int = 4
+    flow_source_noise_sigma: float = 0.0
     flow_loss_weight: float = 0.1
-    flow_detach_encoder: bool = True    # Stop-grad encoder outputs for flow model
+    flow_vel_cos_weight: float = 0.00
     flow_distill_from_ar: bool = False  # If True, flow trains on AR predictions instead of encoder outputs
+    flow_use_cfg: bool = False           # Master switch to enable Classifier-Free Guidance (CFG)
     flow_cfg_dropout: float = 0.15      # Probability of dropping context during flow training (CFG)
     flow_cfg_scale: float = 1.0         # CFG extrapolation scale during actor imagination
-    flow_standardize_latents: bool = False # Standardize latents to standard normal for flow model
+    flow_standardize_latents: bool = True # Standardize latents to standard normal for flow model
     flow_adjoint_method: str = "none"   # Adjoint method ('none' or 'torchdiffeq')
     flow_solver: str = "euler"          # Solver name ('euler', 'rk4', or 'dopri5')
     flow_solver_rtol: float = 1e-5      # Relative tolerance for adaptive solvers (dopri5)
     flow_solver_atol: float = 1e-7      # Absolute tolerance for adaptive solvers (dopri5)
+    flow_sim_temperature: float = 0.1   # Temperature for cosine-similarity softmax (reward, value & termination suppression)
+    flow_floor_quantile: float = 0.0    # Quantile of observed values used as suppression floor (0.0 = minimum)
+
     imagination_mode: str = 'flow'      # 'flow' or 'ar'
+    world_backend: tuple = ('flow',)  # Active backends ('flow', 'ar')
+    world_training: tuple = ('flow',) # Backends active for training reward/termination heads
     
     max_frames: int = 6
     world_horizon: int = 3
@@ -77,9 +83,9 @@ class Config:
     value_target_tau: float = 0.02
     
     use_sigreg: bool = True
-    sigreg_weight: float = 0.03
+    sigreg_weight: float = 0.01
     weak_sigreg: bool = True     # if True, use WeakSIGReg (Frobenius cov loss) instead of SIGReg
-    entropy_scale: float = 3e-3
+    entropy_scale: float = 6e-3
     use_return_ema: bool = False
     use_advantage: bool = False
     reinforce: bool = False
@@ -88,8 +94,18 @@ class Config:
     actor_num_blocks: int = 4
     value_num_blocks: int = 4
     use_symlog: bool = True
+    use_termination: bool = False        # Whether to use the termination head
+
+    beta_real_value: float = 1.0
+    beta_imag_value: float = 1.0
+    beta_value_dynamics: float = 0.03
+
+    # Reward model training weights
+    beta_reward_real: float = 1.0
+    beta_reward_dynamics: float = 0.03
 
     buffer_capacity: int = 50
+    post_bootstrap_buffer_capacity: int = 50
     prefill_episodes: int = 50
     world_bootstrap_steps: int = 500  # extra WM-only gradient steps run after prefill, before training loop
     
@@ -107,6 +123,10 @@ class Config:
     log_dir: str = ""
 
     def __post_init__(self):
+        if not self.flow_use_cfg:
+            self.flow_cfg_dropout = 0.0
+            self.flow_cfg_scale = 1.0
+            
         if not self.log_dir:
             algo = "reinforce" if self.reinforce else "analytical"
             current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -147,6 +167,10 @@ class EpisodeReplayBuffer:
     def __init__(self, capacity=1000):
         self.capacity = capacity
         self.episodes = deque(maxlen=capacity)
+        
+    def set_capacity(self, new_capacity):
+        self.capacity = new_capacity
+        self.episodes = deque(list(self.episodes)[-new_capacity:], maxlen=new_capacity)
         
     def add_episode(self, obs, actions, rewards, terminals):
         self.episodes.append({
@@ -199,33 +223,58 @@ class Trainer:
         
         vision = VisionEncoder(latent_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         action_enc = ActionEncoder(action_space=self.envs.get_action_space(), hidden_dim=cfg.hidden_dim, output_dim=cfg.latent_dim)
-        dynamics_ar = Dynamics(
-            max_frames=cfg.max_frames + cfg.imagination_ctx_frames,
-            action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim,
-            num_layers=cfg.dyn_num_layers, num_heads=cfg.dyn_num_heads,
-            causal=cfg.dyn_causal,
-            block_type=cfg.dyn_block_type,
-        )
-        dynamics_flow = FlowMatchingDynamics(
-            max_frames=cfg.max_frames + cfg.imagination_ctx_frames,
-            action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim,
-            num_layers=cfg.flow_num_layers, num_heads=cfg.flow_num_heads,
-            causal=cfg.flow_causal, num_euler_steps=cfg.flow_num_euler_steps,
-            source_noise_sigma=cfg.flow_source_noise_sigma,
-            adjoint_method=cfg.flow_adjoint_method,
-            solver=cfg.flow_solver,
-            rtol=cfg.flow_solver_rtol,
-            atol=cfg.flow_solver_atol,
-        )
+        # Check configuration validity
+        if cfg.imagination_mode == 'ar' and 'ar' not in cfg.world_backend:
+            raise ValueError("imagination_mode cannot be 'ar' when 'ar' is not in world_backend.")
+        if cfg.imagination_mode == 'flow' and 'flow' not in cfg.world_backend:
+            raise ValueError("imagination_mode cannot be 'flow' when 'flow' is not in world_backend.")
+        for train_backend in cfg.world_training:
+            if train_backend not in cfg.world_backend:
+                raise ValueError(f"world_training backend '{train_backend}' is not active in world_backend: {cfg.world_backend}")
+
+        if 'ar' in cfg.world_backend:
+            dynamics_ar = Dynamics(
+                max_frames=cfg.max_frames + cfg.imagination_ctx_frames,
+                action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim,
+                num_layers=cfg.dyn_num_layers, num_heads=cfg.dyn_num_heads,
+                causal=cfg.dyn_causal,
+                block_type=cfg.dyn_block_type,
+            )
+        else:
+            dynamics_ar = None
+
+        if 'flow' in cfg.world_backend:
+            dynamics_flow = FlowMatchingDynamics(
+                max_frames=cfg.max_frames + cfg.imagination_ctx_frames,
+                action_dim=cfg.latent_dim, hidden_dim=cfg.latent_dim,
+                num_layers=cfg.flow_num_layers, num_heads=cfg.flow_num_heads,
+                causal=cfg.flow_causal, num_euler_steps=cfg.flow_num_euler_steps,
+                source_noise_sigma=cfg.flow_source_noise_sigma,
+                adjoint_method=cfg.flow_adjoint_method,
+                solver=cfg.flow_solver,
+                rtol=cfg.flow_solver_rtol,
+                atol=cfg.flow_solver_atol,
+                standardize_latents=cfg.flow_standardize_latents,
+                vel_cos_weight=cfg.flow_vel_cos_weight,
+            )
+        else:
+            dynamics_flow = None
+
         reward_enc = Reward(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
-        termination_enc = Termination(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
+        if cfg.use_termination:
+            termination_enc = Termination(obs_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
+        else:
+            termination_enc = None
         
         if cfg.recon_debug:
             decoder = VisionDecoder(latent_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
         else:
             decoder = None
             
-        self.world = World(vision, dynamics_ar, dynamics_flow, action_enc, reward_enc, termination_enc, self.cfg.world_horizon, decoder=decoder).to(self.device)
+        self.world = World(
+            vision, dynamics_ar, dynamics_flow, action_enc, reward_enc, termination_enc, 
+            self.cfg.world_horizon, decoder=decoder
+        ).to(self.device)
         self.actor = Actor(action_space=self.envs.get_action_space(), obs_dim=cfg.imagination_ctx_frames * cfg.latent_dim, hidden_dim=cfg.hidden_dim, chunk_size=cfg.world_horizon, num_blocks=cfg.actor_num_blocks).to(self.device)
         self.value_model = Value(obs_dim=cfg.imagination_ctx_frames * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
         self.target_value_model = Value(obs_dim=cfg.imagination_ctx_frames * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
@@ -262,8 +311,8 @@ class Trainer:
             self.landscape_viz = LossLandscapeVisualizer(self)
             self.grad_analyzer = GradientFlowAnalyzer(self)
             self.action_monitor = ActionDistributionMonitor(self)
-            self.flow_diagnostics = FlowDiagnostics(self)
-            self.ar_diagnostics = ARDiagnostics(self)
+            self.flow_diagnostics = FlowDiagnostics(self) if 'flow' in cfg.world_backend else None
+            self.ar_diagnostics = ARDiagnostics(self) if 'ar' in cfg.world_backend else None
             self.diag_output_dir = os.path.join(cfg.log_dir, 'diagnostics')
 
     def set_seed(self, seed):
@@ -346,7 +395,16 @@ class Trainer:
         Seq, B, D = states.shape
         if context is not None:
             ctx_states = context.transpose(0, 1) # (ctx, B, D)
-            ctx_feed = ctx_states[-horizon:-1] # (horizon - 1, B, D)
+            # Detect if the last context state is already prepended to states
+            is_start_prepended = torch.allclose(
+                states[0].float(),
+                ctx_states[-1].to(device=states.device, dtype=states.dtype).float(),
+                atol=1e-4
+            )
+            if is_start_prepended:
+                ctx_feed = ctx_states[-horizon:-1] if horizon > 1 else ctx_states[:0]
+            else:
+                ctx_feed = ctx_states[-(horizon - 1):] if horizon > 1 else ctx_states[:0]
             padded = torch.cat([ctx_feed, states], dim=0)
         else:
             s0 = states[0:1]
@@ -497,18 +555,26 @@ class Trainer:
             sym_rew_batch = rew_batch
         
         self.world.unfreeze()
+        self.value_model.train()
         
         log_recon = self.cfg.recon_debug and (self.world_step % self.cfg.train_steps == 0)
         
+        B, T_act, AS = act_batch.shape
+        
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-            raw_states, target_state, pred_next_state, pred_rewards, pred_terminals, velocity_loss, euler_full, ar_full = self.world(
+            (
+                raw_states, target_state, 
+                pred_next_state, pred_rewards, pred_terminals, 
+                velocity_loss, euler_full, ar_full,
+                pred_rewards_flow, pred_terminals_flow, t, z_pred_flow
+            ) = self.world(
                 act_batch, obs_batch, ctx_frames=self.cfg.imagination_ctx_frames, run_euler=log_recon,
-                flow_detach_encoder=self.cfg.flow_detach_encoder,
                 flow_distill_from_ar=self.cfg.flow_distill_from_ar,
                 flow_standardize_latents=self.cfg.flow_standardize_latents,
                 flow_cfg_dropout=self.cfg.flow_cfg_dropout,
                 flow_cfg_scale=self.cfg.flow_cfg_scale,
-                run_flow=(self.cfg.imagination_mode == 'flow'),
+                run_flow=('flow' in self.cfg.world_backend),
+                world_training=self.cfg.world_training,
             )
             
             recon_loss = None
@@ -538,10 +604,13 @@ class Trainer:
                     recon_pred_loss_ar = F.mse_loss(recon_pred_obs_ar.float(), obs_batch[:, 1:].float())
             
         # Autoregressive dynamics loss (MSE to detached encoder targets)
-        ar_dyn_loss = F.mse_loss(pred_next_state.float(), target_state.detach().float())
+        if 'ar' in self.cfg.world_backend and pred_next_state is not None:
+            ar_dyn_loss = F.mse_loss(pred_next_state.float(), target_state.detach().float())
+        else:
+            ar_dyn_loss = torch.tensor(0.0, device=self.device)
         
-        # Flow matching velocity loss (separate, optionally detached from encoder)
-        if self.cfg.imagination_mode == 'flow':
+        # Flow matching velocity loss
+        if 'flow' in self.cfg.world_backend:
             flow_loss = self.cfg.flow_loss_weight * velocity_loss
         else:
             flow_loss = torch.tensor(0.0, device=self.device)
@@ -549,13 +618,191 @@ class Trainer:
         # Combined dynamics loss (AR + flow)
         dyn_loss = ar_dyn_loss + flow_loss
         
-        rew_loss = F.mse_loss(pred_rewards.float(), sym_rew_batch[:, 1:].float())
-        term_loss = F.binary_cross_entropy_with_logits(pred_terminals.float(), term_batch[:, 1:].float())
+        loss_rew_real = None
+        loss_rew_ar_tf = None
+        loss_rew_flow = None
+        
+        # Reward training
+        with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+            pred_rew_real = self.world.reward(target_state)
+            r_real = sym_rew_batch[:, 1:]
+            loss_rew_real = F.mse_loss(pred_rew_real.float(), r_real.float())
+
+            rew_loss = self.cfg.beta_reward_real * loss_rew_real
+
+            if 'ar' in self.cfg.world_training and pred_next_state is not None:
+                pred_rew_ar_tf = self.world.reward(pred_next_state)
+                loss_rew_ar_tf = F.mse_loss(pred_rew_ar_tf.float(), r_real.float())
+                rew_loss = rew_loss + self.cfg.beta_reward_dynamics * loss_rew_ar_tf
+
+            if 'flow' in self.cfg.world_training and pred_rewards_flow is not None and z_pred_flow is not None:
+                # Proximity-based reward suppression: cosine similarity against all real states
+                sim_rew = F.cosine_similarity(
+                    z_pred_flow.detach().unsqueeze(2),   # (B, H, 1, D)
+                    raw_states.detach().unsqueeze(1),     # (B, 1, T, D)
+                    dim=-1
+                )  # (B, H, T)
+
+                weights_rew = F.softmax(sim_rew / self.cfg.flow_sim_temperature, dim=-1)
+                r_all = sym_rew_batch.squeeze(-1).detach()  # (B, T)
+                r_weighted = (weights_rew * r_all.unsqueeze(1)).sum(dim=-1, keepdim=True)  # (B, H, 1)
+
+                # Confidence: max cosine similarity, clamped to [0, 1]
+                confidence_rew = sim_rew.max(dim=-1, keepdim=True).values.clamp(0, 1)
+
+                # Suppress to min reward floor (0.0 quantile) when far from real states
+                r_floor = sym_rew_batch.detach().float().quantile(self.cfg.flow_floor_quantile)
+                r_target_flow = (r_floor + confidence_rew * (r_weighted - r_floor)).detach()
+
+                loss_rew_flow = F.mse_loss(pred_rewards_flow.float(), r_target_flow.float())
+                rew_loss = rew_loss + self.cfg.beta_reward_dynamics * loss_rew_flow
+
+        # Termination training
+        if self.cfg.use_termination:
+            term_loss = torch.tensor(0.0, device=self.device)
+            if 'ar' in self.cfg.world_training and pred_terminals is not None:
+                term_loss = term_loss + F.binary_cross_entropy_with_logits(pred_terminals.float(), term_batch[:, 1:].float())
+            else:
+                # Train termination head on real encoder outputs
+                pred_term_real = self.world.termination(target_state)
+                term_loss = term_loss + F.binary_cross_entropy_with_logits(pred_term_real.float(), term_batch[:, 1:].float())
+
+            if 'flow' in self.cfg.world_training and pred_terminals_flow is not None and z_pred_flow is not None:
+                # Proximity-based termination suppression
+                sim_term = F.cosine_similarity(
+                    z_pred_flow.detach().unsqueeze(2),
+                    raw_states.detach().unsqueeze(1),
+                    dim=-1
+                )  # (B, H, T)
+
+                weights_term = F.softmax(sim_term / self.cfg.flow_sim_temperature, dim=-1)
+                term_all = term_batch.squeeze(-1).detach()  # (B, T)
+                term_weighted = (weights_term * term_all.unsqueeze(1)).sum(dim=-1, keepdim=True)  # (B, H, 1)
+
+                confidence_term = sim_term.max(dim=-1, keepdim=True).values.clamp(0, 1)
+                term_floor = term_batch.detach().float().quantile(self.cfg.flow_floor_quantile)
+                term_target_flow = (term_floor + confidence_term * (term_weighted - term_floor)).detach()
+
+                term_loss = term_loss + F.binary_cross_entropy_with_logits(pred_terminals_flow.float(), term_target_flow.float())
+        else:
+            term_loss = torch.tensor(0.0, device=self.device)
         
         if self.cfg.use_sigreg:
             sig_loss = self.sig_reg(raw_states.transpose(0, 1).float())
         else:
             sig_loss = torch.tensor(0.0, device=self.device)
+            
+        # --- Value Grounding Losses ---
+        # 1. Real value loss
+        ctx = self.cfg.imagination_ctx_frames
+        B_val, T_val, D_val = raw_states.shape
+        raw_states_T = raw_states.transpose(0, 1) # (T, B, D)
+        history_windows_real = self._get_history_windows(raw_states_T, ctx)
+        
+        # Predict values: (T, B, 1)
+        real_values = self.value_model(history_windows_real)
+        
+        with torch.no_grad():
+            target_real_values = self.target_value_model(history_windows_real)
+            r_real_seq_T = sym_rew_batch.transpose(0, 1) # (T, B, 1)
+            real_terminals_T = term_batch.transpose(0, 1) # (T, B, 1)
+            discounts = self.cfg.discount * (1.0 - real_terminals_T.float())
+            
+            real_lambda_targets = self.value_loss_fn._compute_lambda_returns(
+                values=target_real_values,
+                rewards=r_real_seq_T[:-1],
+                pcont=discounts[:-1]
+            )
+            
+        value_real_loss = F.mse_loss(real_values[:-1], real_lambda_targets.detach())
+
+        value_flow_loss = None
+        flow_val_confidence = None
+        if 'flow' in self.cfg.world_backend and t is not None:
+            # Reshape real history windows: (T, B, ctx, D)
+            hist_real_4d = history_windows_real.reshape(T_val, B_val, ctx, D_val)
+            
+            # Extract source and target states
+            z_src = hist_real_4d[:, :, -2]
+            z_tgt = hist_real_4d[:, :, -1]
+            
+            if self.cfg.flow_standardize_latents:
+                z_src_norm = self.world.latent_rms.normalize(z_src)
+                z_tgt_norm = self.world.latent_rms.normalize(z_tgt)
+            else:
+                z_src_norm = z_src
+                z_tgt_norm = z_tgt
+            
+            # Sample t_val for interpolation
+            t_val = torch.rand(T_val, B_val, device=self.device, dtype=z_src.dtype)
+            t_val_expanded = t_val.unsqueeze(-1) # (T, B, 1)
+            
+            # Add flow noise to source latent
+            if self.world.dynamics_flow.source_noise_sigma == 1.0:
+                z_0_val = torch.randn_like(z_src_norm)
+            elif self.world.dynamics_flow.source_noise_sigma == 0.0:
+                z_0_val = z_src_norm
+            else:
+                noise_val = torch.randn_like(z_src_norm)
+                z_0_val = z_src_norm + self.world.dynamics_flow.source_noise_sigma * noise_val
+                if self.cfg.flow_standardize_latents:
+                    z_0_val = z_0_val / ((1.0 + self.world.dynamics_flow.source_noise_sigma ** 2) ** 0.5)
+            
+            # Interpolate noisy latent state
+            z_t_norm = (1.0 - t_val_expanded) * z_0_val + t_val_expanded * z_tgt_norm
+            
+            if self.cfg.flow_standardize_latents:
+                z_t_val = self.world.latent_rms.denormalize(z_t_norm)
+            else:
+                z_t_val = z_t_norm
+            
+            # Construct noisy history window
+            hist_noisy_4d = hist_real_4d.clone()
+            hist_noisy_4d[:, :, -1] = z_t_val
+            history_windows_noisy = hist_noisy_4d.reshape(T_val, B_val, ctx * D_val)
+            
+            # ---- Proximity-based value target ----
+            # z_t_val: (T, B, D) — noisy interpolated states
+            # raw_states: (B, T_full, D) — all real encoded states
+            z_noisy_BT = z_t_val.permute(1, 0, 2).detach()  # (B, T, D)
+            z_real_BT = raw_states.detach()                   # (B, T_full, D)
+
+            sim_val = F.cosine_similarity(
+                z_noisy_BT.unsqueeze(2),  # (B, T, 1, D)
+                z_real_BT.unsqueeze(1),    # (B, 1, T_full, D)
+                dim=-1
+            )  # (B, T, T_full)
+
+            weights_val = F.softmax(sim_val / self.cfg.flow_sim_temperature, dim=-1)
+            v_all = target_real_values.permute(1, 0, 2).squeeze(-1).detach()  # (B, T_full)
+            v_weighted = (weights_val * v_all.unsqueeze(1)).sum(dim=-1, keepdim=True)  # (B, T, 1)
+
+            # Confidence suppression
+            confidence_val = sim_val.max(dim=-1, keepdim=True).values.clamp(0, 1)  # (B, T, 1)
+            v_floor = target_real_values.detach().float().quantile(self.cfg.flow_floor_quantile)
+            v_target_flow = (v_floor + confidence_val * (v_weighted - v_floor)).permute(1, 0, 2).detach()  # (T, B, 1)
+            flow_val_confidence = confidence_val.mean().item()
+            
+            # Predict values from noisy windows
+            v_noisy = self.value_model(history_windows_noisy)
+            value_flow_loss = F.mse_loss(v_noisy, v_target_flow)
+
+        value_ar_loss = None
+        if 'ar' in self.cfg.world_backend and pred_next_state is not None:
+            pred_next_state_T = pred_next_state.transpose(0, 1) # (T-1, B, D)
+            hist_real_4d = history_windows_real.reshape(T_val, B_val, ctx, D_val)
+            hist_ar_4d = hist_real_4d[1:].clone()
+            hist_ar_4d[:, :, -1] = pred_next_state_T
+            history_windows_ar = hist_ar_4d.reshape(T_val - 1, B_val, ctx * D_val)
+            
+            v_ar = self.value_model(history_windows_ar)
+            value_ar_loss = F.mse_loss(v_ar, real_lambda_targets.detach())
+
+        v_loss = self.cfg.beta_real_value * value_real_loss
+        if value_flow_loss is not None:
+            v_loss = v_loss + self.cfg.beta_value_dynamics * value_flow_loss
+        if value_ar_loss is not None:
+            v_loss = v_loss + self.cfg.beta_value_dynamics * value_ar_loss
         
         if self.cfg.recon_debug:
             wm_loss = dyn_loss + rew_loss + term_loss + total_recon_loss
@@ -564,33 +811,39 @@ class Trainer:
             
         if self.cfg.use_sigreg:
             wm_loss = wm_loss + self.cfg.sigreg_weight * sig_loss
-        
+            
         # Compute individual grad norms for world model losses
         scale_factor = self.scaler.get_scale()
         
         # AR Dynamics Loss
-        self.world_opt.zero_grad(set_to_none=True)
-        self.scaler.scale(ar_dyn_loss).backward(retain_graph=True)
-        ar_dyn_grad_norm = self._compute_grad_norm(self.world) / scale_factor
-        
+        if 'ar' in self.cfg.world_backend:
+            self.world_opt.zero_grad(set_to_none=True)
+            self.scaler.scale(ar_dyn_loss).backward(retain_graph=True)
+            ar_dyn_grad_norm = self._compute_grad_norm(self.world) / scale_factor
+        else:
+            ar_dyn_grad_norm = 0.0
+            
         # Flow Velocity Loss
-        if self.cfg.imagination_mode == 'flow':
+        if 'flow' in self.cfg.world_backend:
             self.world_opt.zero_grad(set_to_none=True)
             self.scaler.scale(flow_loss).backward(retain_graph=True)
             flow_grad_norm = self._compute_grad_norm(self.world) / scale_factor
         else:
             flow_grad_norm = 0.0
-        
+            
         # Reward Loss
         self.world_opt.zero_grad(set_to_none=True)
         self.scaler.scale(rew_loss).backward(retain_graph=True)
         rew_grad_norm = self._compute_grad_norm(self.world) / scale_factor
         
         # Termination Loss
-        self.world_opt.zero_grad(set_to_none=True)
-        self.scaler.scale(term_loss).backward(retain_graph=True)
-        term_grad_norm = self._compute_grad_norm(self.world) / scale_factor
-        
+        if self.cfg.use_termination:
+            self.world_opt.zero_grad(set_to_none=True)
+            self.scaler.scale(term_loss).backward(retain_graph=True)
+            term_grad_norm = self._compute_grad_norm(self.world) / scale_factor
+        else:
+            term_grad_norm = 0.0
+            
         # SIGReg Loss
         if self.cfg.use_sigreg:
             self.world_opt.zero_grad(set_to_none=True)
@@ -607,27 +860,61 @@ class Trainer:
         else:
             recon_grad_norm = 0.0
             
+        # Value Grounding Loss Grad Norm
+        self.value_opt.zero_grad(set_to_none=True)
+        self.scaler.scale(v_loss).backward(retain_graph=True)
+        v_grad_norm = self._compute_grad_norm(self.value_model) / scale_factor
+            
         # Combined backward
         self.world_opt.zero_grad(set_to_none=True)
-        self.scaler.scale(wm_loss).backward()
+        self.value_opt.zero_grad(set_to_none=True)
+        
+        total_loss = wm_loss + v_loss
+        self.scaler.scale(total_loss).backward()
+        
         self.scaler.unscale_(self.world_opt)
+        self.scaler.unscale_(self.value_opt)
         grad_norm = self._compute_grad_norm(self.world)
         torch.nn.utils.clip_grad_norm_(self.world.parameters(), self.cfg.grad_clip_norm)
+        torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.cfg.grad_clip_norm)
         
         self.scaler.step(self.world_opt)
+        self.scaler.step(self.value_opt)
         self.scaler.update()
         
-        self.writer.add_scalar('Loss/World_Total', wm_loss.item(), self.world_step)
+        self.update_value_target()
+        
+        self.writer.add_scalar('Loss/World_Total', total_loss.item(), self.world_step)
+        self.writer.add_scalar('Loss/World_WM_Only', wm_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_AR_Dynamics', ar_dyn_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Flow_Velocity', flow_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Dynamics', dyn_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Reward', rew_loss.item(), self.world_step)
+        if loss_rew_real is not None:
+            self.writer.add_scalar('Loss/World_Reward_Real', loss_rew_real.item(), self.world_step)
+        if loss_rew_ar_tf is not None:
+            self.writer.add_scalar('Loss/World_Reward_AR', loss_rew_ar_tf.item(), self.world_step)
+        if loss_rew_flow is not None:
+            self.writer.add_scalar('Loss/World_Reward_Flow', loss_rew_flow.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Termination', term_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_SIGReg', sig_loss.item(), self.world_step)
+        
+        # Log value grounding losses to TensorBoard
+        self.writer.add_scalar('Loss/Agent_Value_Real', value_real_loss.item(), self.world_step)
+        if value_flow_loss is not None:
+            self.writer.add_scalar('Loss/Agent_Value_Flow', value_flow_loss.item(), self.world_step)
+        if value_ar_loss is not None:
+            self.writer.add_scalar('Loss/Agent_Value_AR', value_ar_loss.item(), self.world_step)
+        if flow_val_confidence is not None:
+            self.writer.add_scalar('Proximity/Value_Confidence_Mean', flow_val_confidence, self.world_step)
+        if loss_rew_flow is not None:
+            self.writer.add_scalar('Proximity/Reward_Confidence_Mean', confidence_rew.mean().item(), self.world_step)
+            
         self.writer.add_scalar('GradNorm/World_SIGReg', sig_grad_norm, self.world_step)
         self.writer.add_scalar('GradNorm/World_Termination', term_grad_norm, self.world_step)
         self.writer.add_scalar('GradNorm/World_AR_Dynamics', ar_dyn_grad_norm, self.world_step)
         self.writer.add_scalar('GradNorm/World_Flow_Velocity', flow_grad_norm, self.world_step)
+        self.writer.add_scalar('GradNorm/Agent_Value', v_grad_norm, self.world_step)
         
         if self.cfg.recon_debug:
             self.writer.add_scalar('Loss/World_Reconstruction', recon_loss.item(), self.world_step)
@@ -646,7 +933,7 @@ class Trainer:
             
         self.world_step += 1
         
-        return raw_states.detach(), act_batch.detach(), wm_loss.item()
+        return raw_states.detach(), act_batch.detach(), rew_batch.detach(), term_batch.detach(), wm_loss.item()
 
     @torch.no_grad()
     def visualize_reconstruction(self, obs_batch, raw_states, act_batch):
@@ -666,24 +953,28 @@ class Trainer:
         
         # Open-loop AR dynamics (fair comparison with flow matching)
         T_act = act_batch.size(1)
-        all_action_emb = self.world.action(act_batch[idx:idx+1].reshape(-1, AS)).reshape(1, T_act, -1)
         
-        ar_open_loop = []
-        curr_seq = raw_states[idx:idx+1, :ctx]  # (1, ctx, D)
-        
-        for i in range(T_act - ctx + 1):
-            act_seq = all_action_emb[:, :ctx + i]
-            pred = self.world.dynamics_ar(curr_seq, act_seq)
-            next_state = pred[:, -1:]  # (1, 1, D)
-            ar_open_loop.append(next_state)
-            curr_seq = torch.cat([curr_seq, next_state], dim=1)
+        if self.world.dynamics_ar is not None:
+            all_action_emb = self.world.action(act_batch[idx:idx+1].reshape(-1, AS)).reshape(1, T_act, -1)
+            ar_open_loop = []
+            curr_seq = raw_states[idx:idx+1, :ctx]  # (1, ctx, D)
             
-        ar_aligned_states = torch.cat(ar_open_loop, dim=1) # (1, H, D)
-        recon_ar_pred_obs = self.world.decoder(ar_aligned_states.detach())
-        ar_aligned = recon_ar_pred_obs[0].detach().cpu()
+            for i in range(T_act - ctx + 1):
+                act_seq = all_action_emb[:, :ctx + i]
+                pred = self.world.dynamics_ar(curr_seq, act_seq)
+                next_state = pred[:, -1:]  # (1, 1, D)
+                ar_open_loop.append(next_state)
+                curr_seq = torch.cat([curr_seq, next_state], dim=1)
+                
+            ar_aligned_states = torch.cat(ar_open_loop, dim=1) # (1, H, D)
+            recon_ar_pred_obs = self.world.decoder(ar_aligned_states.detach())
+            ar_aligned = recon_ar_pred_obs[0].detach().cpu()
+        else:
+            ar_aligned_states = None
+            ar_aligned = None
         
         # 3. Flow matching Euler predictions
-        if self.cfg.imagination_mode == 'flow':
+        if self.cfg.imagination_mode == 'flow' and self.world.dynamics_flow is not None:
             if self.cfg.flow_standardize_latents:
                 ctx_states_norm = self.world.latent_rms.normalize(ctx_states)
                 euler_pred_norm = self.world.dynamics_flow.generate(
@@ -726,12 +1017,15 @@ class Trainer:
             enc_values = enc_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()[ctx:]
 
         # AR model value predictions
-        ar_windows = self._get_history_windows(ar_aligned_states.transpose(0, 1), self.cfg.imagination_ctx_frames, context=ctx_states)
-        with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-            ar_vals_raw = self.value_model(ar_windows)
-            if self.cfg.use_symlog:
-                ar_vals_raw = symexp(ar_vals_raw)
-            ar_values = ar_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()
+        if ar_aligned_states is not None:
+            ar_windows = self._get_history_windows(ar_aligned_states.transpose(0, 1), self.cfg.imagination_ctx_frames, context=ctx_states)
+            with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                ar_vals_raw = self.value_model(ar_windows)
+                if self.cfg.use_symlog:
+                    ar_vals_raw = symexp(ar_vals_raw)
+                ar_values = ar_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()
+        else:
+            ar_values = None
 
         # Draw values on encoded frames
         encoded_with_val = []
@@ -775,20 +1069,29 @@ class Trainer:
                 annotated.append(to_tensor(img_pil))
             return torch.stack(annotated, dim=0)
         
-        ar_annotated = annotate_frames(ar_aligned, "AR", "cyan", values_array=ar_values)
-        
         grid_actual = torchvision.utils.make_grid(actual, nrow=actual.size(0), normalize=False)
         grid_encoded = torchvision.utils.make_grid(encoded_with_val, nrow=encoded_with_val.size(0), normalize=False)
-        grid_ar = torchvision.utils.make_grid(ar_annotated, nrow=ar_annotated.size(0), normalize=False)
         
-        if self.cfg.imagination_mode == 'flow':
+        grid_elements = [grid_actual, grid_encoded]
+        
+        if ar_aligned is not None:
+            ar_annotated = annotate_frames(ar_aligned, "AR", "cyan", values_array=ar_values)
+            grid_ar = torchvision.utils.make_grid(ar_annotated, nrow=ar_annotated.size(0), normalize=False)
+            grid_elements.append(grid_ar)
+            
+        if flow_aligned is not None:
             flow_annotated = annotate_frames(flow_aligned, "FLOW", "red", values_array=flow_values)
             grid_flow = torchvision.utils.make_grid(flow_annotated, nrow=flow_annotated.size(0), normalize=False)
-            combined_grid = torch.cat([grid_actual, grid_encoded, grid_ar, grid_flow], dim=1)
-            self.writer.add_image('Reconstruction/Actual_vs_Encoded_vs_AR_vs_Flow', combined_grid, self.world_step)
-        else:
-            combined_grid = torch.cat([grid_actual, grid_encoded, grid_ar], dim=1)
-            self.writer.add_image('Reconstruction/Actual_vs_Encoded_vs_AR', combined_grid, self.world_step)
+            grid_elements.append(grid_flow)
+            
+        combined_grid = torch.cat(grid_elements, dim=1)
+        grid_name = "Reconstruction/Actual_vs_Encoded"
+        if ar_aligned is not None:
+            grid_name += "_vs_AR"
+        if flow_aligned is not None:
+            grid_name += "_vs_Flow"
+            
+        self.writer.add_image(grid_name, combined_grid, self.world_step)
 
         # Plot predicted values comparison
         try:
@@ -799,8 +1102,9 @@ class Trainer:
             fig, ax = plt.subplots(figsize=(6, 4))
             timesteps = np.arange(len(enc_values))
             ax.plot(timesteps, enc_values, label='Encoded (GT)', color='green', marker='o')
-            ax.plot(timesteps, ar_values, label='AR Imagination', color='cyan', marker='s')
-            if self.cfg.imagination_mode == 'flow':
+            if ar_values is not None:
+                ax.plot(timesteps, ar_values, label='AR Imagination', color='cyan', marker='s')
+            if flow_values is not None:
                 ax.plot(timesteps, flow_values, label='FLOW Imagination', color='red', marker='^')
             ax.set_xlabel('Imagination Steps')
             ax.set_ylabel('Predicted Value')
@@ -815,7 +1119,7 @@ class Trainer:
             print(f"Failed to log value predictions plot: {e}")
         
         # --- Velocity field diagnostics ---
-        if self.cfg.imagination_mode == 'flow':
+        if self.cfg.imagination_mode == 'flow' and self.world.dynamics_flow is not None and euler_pred is not None:
             target_states_all = raw_states[idx:idx+1, 1:]
             future_targets = target_states_all[:, ctx-1:]
             source = ctx_states[:, -1:].expand_as(euler_pred)
@@ -853,7 +1157,7 @@ class Trainer:
             euler_mse = (euler_pred - future_targets).pow(2).mean().item()
             self.writer.add_scalar('Diag/Euler_MSE_to_Target', euler_mse, self.world_step)
 
-    def train_agent(self, start_states, real_actions):
+    def train_agent(self, start_states, real_actions, real_rewards, real_terminals):
         """
         Updates Actor and Value models using differentiable imagination.
         Imagination is seeded with a window of `imagination_ctx_frames` consecutive real
@@ -865,6 +1169,8 @@ class Trainer:
             start_states: (B, T, D)   — raw encoded states from the world model forward pass.
             real_actions: (B, T-1, A) — raw actions from the replay buffer that caused
                                         those state transitions.
+            real_rewards: (B, T, 1)   - real rewards from the replay buffer.
+            real_terminals: (B, T, 1) - real terminals from the replay buffer.
         """
         self.world.freeze()
 
@@ -886,6 +1192,11 @@ class Trainer:
             # Pad actions with zeros at the front
             pad_a = real_actions[:, :1].expand(B_wm, ctx - T, A) * 0
             real_actions = torch.cat([pad_a, real_actions], dim=1)
+            # Pad rewards and terminals as well
+            pad_r = real_rewards[:, :1].expand(B_wm, ctx - T, 1) * 0
+            real_rewards = torch.cat([pad_r, real_rewards], dim=1)
+            pad_term = real_terminals[:, :1].expand(B_wm, ctx - T, 1) * 0
+            real_terminals = torch.cat([pad_term, real_terminals], dim=1)
             max_start = 0
 
         # Draw batch_size random (batch_item, start_idx) pairs
@@ -948,12 +1259,15 @@ class Trainer:
             pred_term_probs = torch.sigmoid(imagined_terminals)
             pcont = (1.0 - pred_term_probs).detach()
             
-            v_loss, targets_v = self.value_loss_fn(
+            value_imag_loss, targets_v = self.value_loss_fn(
                 imagined_values, 
                 imagined_rewards, 
                 pcont=pcont, 
                 target_values=ema_imagined_values.detach()  # fully detached for value bootstrap
             )
+
+            # --- 1. Combined Value Loss ---
+            v_loss = self.cfg.beta_imag_value * value_imag_loss
 
             # Compute actor targets using the EMA value model (more stable estimates)
             targets_a = self.value_loss_fn._compute_lambda_returns(
@@ -1042,6 +1356,7 @@ class Trainer:
         self.update_value_target()
 
         self.writer.add_scalar('Loss/Agent_Value', v_loss.item(), self.agent_step)
+        self.writer.add_scalar('Loss/Agent_Value_Imag', value_imag_loss.item(), self.agent_step)
         self.writer.add_scalar('Loss/Agent_Actor', a_loss.item(), self.agent_step)
         self.writer.add_scalar('Loss/Agent_Actor_Target', a_target_loss.item(), self.agent_step)
         self.writer.add_scalar('Loss/Agent_Actor_Entropy', a_entropy_loss.item(), self.agent_step)
@@ -1080,32 +1395,42 @@ class Trainer:
 
         try:
             # 0. Flow matching diagnostics (PCA trajectories and velocity fields)
-            if self.cfg.imagination_mode == 'flow':
+            if self.flow_diagnostics is not None:
                 flow_data = self.flow_diagnostics.collect_flow_data(start_states, real_actions)
                 fig_traj = self.flow_diagnostics.plot_flow_trajectories(flow_data, save_dir=save_dir)
                 if fig_traj is not None:
-                    self.writer.add_figure('Diag/Flow_Trajectories', fig_traj, step)
+                    self.writer.add_figure('Diag/Flow_Matching/Trajectories', fig_traj, step)
                     plt.close(fig_traj)
-                self.writer.add_scalar('Diag/Flow_Cosine_Sim_t0', flow_data['cos_sim'], step)
-                self.writer.add_scalar('Diag/Flow_Dist_to_Target_Mean', flow_data['dist_to_target'], step)
+                self.writer.add_scalar('Diag/Flow_Matching/Cosine_Sim_t0', flow_data['cos_sim'], step)
+                self.writer.add_scalar('Diag/Flow_Matching/Dist_to_Target_Mean', flow_data['dist_to_target'], step)
+
+                # Flow matching action impact diagnostics
+                flow_impact_data = self.flow_diagnostics.collect_flow_action_impact(start_states, real_actions)
+                fig_flow_impact = self.flow_diagnostics.plot_flow_action_impact(flow_impact_data, save_dir=save_dir)
+                if fig_flow_impact is not None:
+                    self.writer.add_figure('Diag/Flow_Matching/Action_Impact', fig_flow_impact, step)
+                    plt.close(fig_flow_impact)
+                self.writer.add_scalar('Diag/Flow_Matching/Zero_Action_MSE_Final', flow_impact_data['mse_zero'][-1], step)
+                self.writer.add_scalar('Diag/Flow_Matching/Rand_Action_MSE_Final', flow_impact_data['mse_rand'][-1], step)
+                self.writer.add_scalar('Diag/Flow_Matching/Opp_Action_MSE_Final', flow_impact_data['mse_opp'][-1], step)
 
             # 1. Action distribution stats (fast)
             action_stats = self.action_monitor.collect_action_stats(start_states, real_actions)
             fig_health, fig_hist, fig_profile = self.action_monitor.plot_action_stats(action_stats, save_dir=save_dir)
             if fig_health is not None:
-                self.writer.add_figure('Diag/Action_Health', fig_health, step)
+                self.writer.add_figure('Diag/Action/Health', fig_health, step)
                 plt.close(fig_health)
             if fig_hist is not None:
-                self.writer.add_figure('Diag/Action_PreTanh_Hist', fig_hist, step)
+                self.writer.add_figure('Diag/Action/PreTanh_Hist', fig_hist, step)
                 plt.close(fig_hist)
             if fig_profile is not None:
-                self.writer.add_figure('Diag/Action_Profile', fig_profile, step)
+                self.writer.add_figure('Diag/Action/Profile', fig_profile, step)
                 plt.close(fig_profile)
 
-            self.writer.add_scalar('Diag/PreTanh_MeanAbs_Max', float(action_stats['pre_tanh_mean_abs'].max()), step)
-            self.writer.add_scalar('Diag/PostTanh_MeanAbs_Max', float(action_stats['post_tanh_mean_abs'].max()), step)
-            self.writer.add_scalar('Diag/ActionStd_Min', float(action_stats['pre_tanh_std'].min()), step)
-            self.writer.add_scalar('Diag/AnalyticalEntropy_Mean', float(action_stats['analytical_entropy'].mean()), step)
+            self.writer.add_scalar('Diag/Action/PreTanh_MeanAbs_Max', float(action_stats['pre_tanh_mean_abs'].max()), step)
+            self.writer.add_scalar('Diag/Action/PostTanh_MeanAbs_Max', float(action_stats['post_tanh_mean_abs'].max()), step)
+            self.writer.add_scalar('Diag/Action/Std_Min', float(action_stats['pre_tanh_std'].min()), step)
+            self.writer.add_scalar('Diag/Action/AnalyticalEntropy_Mean', float(action_stats['analytical_entropy'].mean()), step)
 
             # 2. Loss landscape (moderate cost)
             landscape_data = self.landscape_viz.compute_landscape(
@@ -1116,14 +1441,14 @@ class Trainer:
             landscape_figs = self.landscape_viz.plot_landscape(landscape_data, save_dir=save_dir)
             if landscape_figs is not None:
                 for fig_name, fig in landscape_figs.items():
-                    self.writer.add_figure(f'Diag/Landscape_{fig_name.title()}', fig, step)
+                    self.writer.add_figure(f'Diag/Loss_Landscape/Landscape_{fig_name.title()}', fig, step)
                     plt.close(fig)
 
             total = landscape_data['total_loss']
             center = total[self.cfg.diag_landscape_grid // 2, self.cfg.diag_landscape_grid // 2]
-            self.writer.add_scalar('Diag/Landscape_CenterLoss', center, step)
-            self.writer.add_scalar('Diag/Landscape_Std', float(total.std()), step)
-            self.writer.add_scalar('Diag/Landscape_Range', float(total.max() - total.min()), step)
+            self.writer.add_scalar('Diag/Loss_Landscape/CenterLoss', center, step)
+            self.writer.add_scalar('Diag/Loss_Landscape/Std', float(total.std()), step)
+            self.writer.add_scalar('Diag/Loss_Landscape/Range', float(total.max() - total.min()), step)
 
             # 3. Gradient slice (moderate cost)
             slice_data = self.landscape_viz.compute_gradient_slice(
@@ -1132,21 +1457,21 @@ class Trainer:
             )
             fig_slice = self.landscape_viz.plot_gradient_slice(slice_data, save_dir=save_dir)
             if fig_slice is not None:
-                self.writer.add_figure('Diag/Gradient_Slice', fig_slice, step)
+                self.writer.add_figure('Diag/Gradients/Slice', fig_slice, step)
                 plt.close(fig_slice)
             if slice_data:
-                self.writer.add_scalar('Diag/GradNorm_Actor', slice_data['grad_norm'], step)
+                self.writer.add_scalar('Diag/Gradients/GradNorm_Actor', slice_data['grad_norm'], step)
 
             # 4. Per-layer gradient norms
             self.landscape_viz._run_actor_forward_with_grad(start_states, real_actions)
             norms = self.grad_analyzer.per_layer_grad_norms()
             fig_norms = self.grad_analyzer.plot_grad_norms(norms, save_dir=save_dir)
             if fig_norms is not None:
-                self.writer.add_figure('Diag/Grad_Norms', fig_norms, step)
+                self.writer.add_figure('Diag/Gradients/Layer_Grad_Norms', fig_norms, step)
                 plt.close(fig_norms)
 
             vanishing = sum(1 for v in norms.values() if v < 1e-7)
-            self.writer.add_scalar('Diag/VanishingLayers', vanishing, step)
+            self.writer.add_scalar('Diag/Gradients/VanishingLayers', vanishing, step)
 
             # 5. Finite-difference check (expensive, optional)
             if self.cfg.diag_fd_check:
@@ -1155,21 +1480,22 @@ class Trainer:
                 )
                 fig_fd = self.grad_analyzer.plot_fd_comparison(fd_data, save_dir=save_dir)
                 if fig_fd is not None:
-                    self.writer.add_figure('Diag/FD_Check', fig_fd, step)
+                    self.writer.add_figure('Diag/FD_Check/Check', fig_fd, step)
                     plt.close(fig_fd)
-                self.writer.add_scalar('Diag/FD_CosineSim', fd_data['cosine_similarity'], step)
-                self.writer.add_scalar('Diag/FD_RelError', fd_data['mean_relative_error'], step)
+                self.writer.add_scalar('Diag/FD_Check/CosineSim', fd_data['cosine_similarity'], step)
+                self.writer.add_scalar('Diag/FD_Check/RelError', fd_data['mean_relative_error'], step)
 
             # 6. Autoregressive action impact diagnostics
-            ar_data = self.ar_diagnostics.collect_ar_data(start_states, real_actions)
-            fig_ar = self.ar_diagnostics.plot_ar_trajectories(ar_data, save_dir=save_dir)
-            if fig_ar is not None:
-                self.writer.add_figure('Diag/AR_Action_Impact', fig_ar, step)
-                plt.close(fig_ar)
-            self.writer.add_scalar('Diag/AR_Zero_Action_MSE_Final', ar_data['mse_zero'][-1], step)
-            self.writer.add_scalar('Diag/AR_Rand_Action_MSE_Final', ar_data['mse_rand'][-1], step)
-            self.writer.add_scalar('Diag/AR_Opp_Action_MSE_Final', ar_data['mse_opp'][-1], step)
-            self.writer.add_scalar('Diag/AR_Dist_to_Target', ar_data['dist_to_target'], step)
+            if self.ar_diagnostics is not None:
+                ar_data = self.ar_diagnostics.collect_ar_data(start_states, real_actions)
+                fig_ar = self.ar_diagnostics.plot_ar_trajectories(ar_data, save_dir=save_dir)
+                if fig_ar is not None:
+                    self.writer.add_figure('Diag/AR_Dynamics/Action_Impact', fig_ar, step)
+                    plt.close(fig_ar)
+                self.writer.add_scalar('Diag/AR_Dynamics/Zero_Action_MSE_Final', ar_data['mse_zero'][-1], step)
+                self.writer.add_scalar('Diag/AR_Dynamics/Rand_Action_MSE_Final', ar_data['mse_rand'][-1], step)
+                self.writer.add_scalar('Diag/AR_Dynamics/Opp_Action_MSE_Final', ar_data['mse_opp'][-1], step)
+                self.writer.add_scalar('Diag/AR_Dynamics/Dist_to_Target', ar_data['dist_to_target'], step)
 
             print(f"[Diagnostics] Done. Plots saved to {save_dir}")
 
@@ -1208,6 +1534,10 @@ class Trainer:
                 print("World model bootstrap complete.")
             # ────────────────────────────────────────────────────────────────
 
+            # Post-bootstrapping buffer capacity adjustment
+            print(f"Post-bootstrapping: changing buffer capacity from {self.buffer.capacity} to {self.cfg.post_bootstrap_buffer_capacity}.")
+            self.buffer.set_capacity(self.cfg.post_bootstrap_buffer_capacity)
+
             agent_updates_per_world = int(1.0 / self.cfg.world_agent_ratio) if self.cfg.world_agent_ratio < 1 else 1
             world_update_freq = int(self.cfg.world_agent_ratio) if self.cfg.world_agent_ratio >= 1 else 1
 
@@ -1225,14 +1555,16 @@ class Trainer:
                     batch = self.buffer.sample_sequences(self.cfg.batch_size, self.cfg.max_frames)
                     if batch is None: continue
                     
-                    raw_states, real_actions, wm_loss = self.train_world(batch)
+                    raw_states, real_actions, real_rewards, real_terminals, wm_loss = self.train_world(batch)
                     avg_wm_loss.append(wm_loss)
 
                     if step % world_update_freq == 0:
                         for _ in range(agent_updates_per_world):
                             # raw_states:   (B, T,   D) — real encoded states
                             # real_actions: (B, T-1, A) — real actions from the replay buffer
-                            v_loss, a_loss = self.train_agent(raw_states, real_actions)
+                            v_loss, a_loss = self.train_agent(
+                                raw_states, real_actions, real_rewards, real_terminals
+                            )
                             avg_v_loss.append(v_loss)
                             avg_a_loss.append(a_loss)
                     

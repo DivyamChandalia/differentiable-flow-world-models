@@ -8,6 +8,7 @@ import numpy as np
 class VisionEncoder(nn.Module):
     def __init__(self, latent_dim, hidden_dim, in_channels=3, img_size=224):
         super().__init__()
+        self.latent_dim = latent_dim
         
         # A tiny, randomly initialized CNN backbone
         # Takes (B, in_channels, H, W) -> outputs a spatial feature map
@@ -134,15 +135,15 @@ class VisionDecoder(nn.Module):
         self.fc = nn.Linear(latent_dim, hidden_dim * 4 * 4)
         
         self.deconv1 = nn.ConvTranspose2d(hidden_dim, hidden_dim // 2, kernel_size=4, stride=2, padding=1)
-        self.norm1 = nn.BatchNorm2d(hidden_dim // 2)
+        self.norm1 = nn.GroupNorm(8, hidden_dim // 2)
         self.act1 = nn.SiLU()
         
         self.deconv2 = nn.ConvTranspose2d(hidden_dim // 2, hidden_dim // 4, kernel_size=4, stride=2, padding=1)
-        self.norm2 = nn.BatchNorm2d(hidden_dim // 4)
+        self.norm2 = nn.GroupNorm(8, hidden_dim // 4)
         self.act2 = nn.SiLU()
         
         self.deconv3 = nn.ConvTranspose2d(hidden_dim // 4, hidden_dim // 8, kernel_size=4, stride=2, padding=1)
-        self.norm3 = nn.BatchNorm2d(hidden_dim // 8)
+        self.norm3 = nn.GroupNorm(8, hidden_dim // 8)
         self.act3 = nn.SiLU()
         
         self.deconv4 = nn.ConvTranspose2d(hidden_dim // 8, out_channels, kernel_size=4, stride=2, padding=1)

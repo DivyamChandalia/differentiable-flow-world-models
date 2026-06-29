@@ -118,6 +118,8 @@ class FlowMatchingDynamics(nn.Module):
         solver='euler',
         rtol=1e-5,
         atol=1e-7,
+        standardize_latents=False,
+        vel_cos_weight=0.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -129,6 +131,8 @@ class FlowMatchingDynamics(nn.Module):
         self.rtol = rtol
         self.atol = atol
         self.horizon = max_frames
+        self.standardize_latents = standardize_latents
+        self.vel_cos_weight = vel_cos_weight
 
         # ── Input projections & Positional Embeddings ───────────────────
         self.proj_x = nn.Linear(hidden_dim, hidden_dim)
@@ -264,8 +268,15 @@ class FlowMatchingDynamics(nn.Module):
 
         # Warm-start: perturb the broadcast source with noise to provide
         # per-position diversity while keeping the source informative.
-        noise = torch.randn_like(source_states)
-        z_0 = source_states + self.source_noise_sigma * noise  # (B, H, D)
+        if self.source_noise_sigma == 1.0:
+            z_0 = torch.randn_like(source_states)
+        elif self.source_noise_sigma == 0.0:
+            z_0 = source_states
+        else:
+            noise = torch.randn_like(source_states)
+            z_0 = source_states + self.source_noise_sigma * noise  # (B, H, D)
+            if self.standardize_latents:
+                z_0 = z_0 / ((1.0 + self.source_noise_sigma ** 2) ** 0.5)
 
         # Per-sequence uniform time sampling
         # We MUST sample a single t per sequence to avoid target leakage across positions
@@ -290,6 +301,13 @@ class FlowMatchingDynamics(nn.Module):
 
         # Velocity matching loss
         velocity_loss = torch.nn.functional.mse_loss(velocity_pred, velocity_target)
+        if self.vel_cos_weight > 0.0:
+            loss_vel_cos = 1.0 - torch.nn.functional.cosine_similarity(
+                velocity_pred.flatten(1),
+                velocity_target.flatten(1),
+                dim=-1
+            ).mean()
+            velocity_loss = velocity_loss + self.vel_cos_weight * loss_vel_cos
 
         return velocity_loss
 
@@ -351,7 +369,12 @@ class FlowMatchingDynamics(nn.Module):
             z = ctx_states[:, -1:].expand(-1, H, -1).clone()
 
         # Warm-start noise — matches training distribution
-        z = z + self.source_noise_sigma * torch.randn_like(z)
+        if self.source_noise_sigma == 1.0:
+            z = torch.randn_like(z)
+        elif self.source_noise_sigma > 0.0:
+            z = z + self.source_noise_sigma * torch.randn_like(z)
+            if self.standardize_latents:
+                z = z / ((1.0 + self.source_noise_sigma ** 2) ** 0.5)
 
         solver_name = self.solver.lower()
 
