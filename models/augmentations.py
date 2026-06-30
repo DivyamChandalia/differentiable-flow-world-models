@@ -134,3 +134,31 @@ def augment_obs(
         out = out + noise_std * torch.randn_like(out)
 
     return out.clamp(0.0, 1.0)
+
+
+def time_symmetry_aug(
+    obs: torch.Tensor,
+    act: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Time-reversal augmentation: reverse frame order and negate actions.
+
+    For a sequence ``(f0, f1, …, fT)`` with actions ``(a01, a12, …, a_{T-1,T})``:
+    - Reversed obs:  ``(fT, …, f1, f0)``
+    - Reversed acts: ``(-a_{T-1,T}, …, -a12, -a01)``
+
+    This is a valid self-supervised invariance for physics-reversible environments
+    (e.g. Cartpole). Training on both forward and reversed sequences forces the
+    encoder to build temporally-symmetric representations, dramatically improving
+    generalisation to held-out sequences and OOD conditions.
+
+    Typically applied with 50 % probability each step so the model still sees
+    the original direction.
+
+    Args:
+        obs: ``(B, T,   C, H, W)`` float in ``[0, 1]``.
+        act: ``(B, T-1, A)``       float.
+
+    Returns:
+        ``(aug_obs, aug_act)`` of the same shapes.
+    """
+    return obs.flip(dims=[1]), act.flip(dims=[1]).neg()

@@ -16,7 +16,7 @@ from models.dynamics import Dynamics, FlowMatchingDynamics
 from models.world_helpers import VisionEncoder, ActionEncoder, Reward, VisionDecoder, Termination
 import torchvision
 from models.world import World
-from models.augmentations import augment_obs
+from models.augmentations import augment_obs, time_symmetry_aug
 import os
 from datetime import datetime
 from models.common import symlog, symexp
@@ -63,11 +63,12 @@ class Config:
 
     # Augmentation / View Consistency
     flow_use_shift: bool = True             # Enable spatial shift augmentation (random_shift, pad=3)
-    flow_use_color: bool = True             # Enable sequence-consistent brightness & contrast jitter
-    flow_sensor_noise: float = 0.005        # Std-dev of independent Gaussian sensor noise
-    flow_use_consistency: bool = True       # Enable view consistency loss between two augmented views
-    flow_consistency_weight: float = 0.1    # Weight of the view consistency loss term
-    flow_training_method: str = 'cfm'      # Dynamics objective: 'cfm', 'euler', or 'both'
+    flow_use_color: bool = False             # Enable sequence-consistent brightness & contrast jitter
+    flow_sensor_noise: float = 0.000        # Std-dev of independent Gaussian sensor noise
+    flow_use_consistency: bool = False      # Enable view consistency loss between two augmented views
+    flow_consistency_weight: float = 0.001   # Weight of the view consistency loss term
+    flow_training_method: str = 'cfm'       # Dynamics objective: 'cfm', 'euler', or 'both'
+    flow_use_time_sym: bool = True           # Apply time-reversal aug (50 % of steps): reverses frames & negates actions
 
     imagination_mode: str = 'flow'      # 'flow' or 'ar'
     world_backend: tuple = ('flow',)  # Active backends ('flow', 'ar')
@@ -592,6 +593,17 @@ class Trainer:
         B, T_act, AS = act_batch.shape
         
         # -----------------------------------------------------------------------
+        # Time-symmetry augmentation (50 % of steps)
+        # Applied first, before any observation-level augmentation, because it
+        # also modifies act_batch (flip + negate).  aug_act is carried through
+        # the entire forward pass so rewards/terminals still align correctly.
+        # -----------------------------------------------------------------------
+        if self.cfg.flow_use_time_sym and torch.rand(1).item() < 0.5:
+            aug_obs_base, aug_act = time_symmetry_aug(obs_batch, act_batch)
+        else:
+            aug_obs_base, aug_act = obs_batch, act_batch
+
+        # -----------------------------------------------------------------------
         # Augment observations for flow matching training
         # If view consistency is enabled we need two independent augmented views.
         # -----------------------------------------------------------------------
@@ -602,14 +614,14 @@ class Trainer:
         )
         if need_aug:
             augmented_obs_1 = augment_obs(
-                obs_batch,
+                aug_obs_base,
                 use_shift=self.cfg.flow_use_shift,
                 use_color=self.cfg.flow_use_color,
                 noise_std=self.cfg.flow_sensor_noise,
             )
             if self.cfg.flow_use_consistency:
                 augmented_obs_2 = augment_obs(
-                    obs_batch,
+                    aug_obs_base,
                     use_shift=self.cfg.flow_use_shift,
                     use_color=self.cfg.flow_use_color,
                     noise_std=self.cfg.flow_sensor_noise,
@@ -617,7 +629,7 @@ class Trainer:
             else:
                 augmented_obs_2 = None
         else:
-            augmented_obs_1 = obs_batch
+            augmented_obs_1 = aug_obs_base
             augmented_obs_2 = None
 
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
@@ -628,7 +640,7 @@ class Trainer:
                 pred_rewards_flow, pred_terminals_flow, t, z_pred_flow,
                 cfm_loss, euler_loss,
             ) = self.world(
-                act_batch, augmented_obs_1,
+                aug_act, augmented_obs_1,
                 ctx_frames=self.cfg.imagination_ctx_frames, run_euler=log_recon,
                 flow_distill_from_ar=self.cfg.flow_distill_from_ar,
                 flow_standardize_latents=self.cfg.flow_standardize_latents,
