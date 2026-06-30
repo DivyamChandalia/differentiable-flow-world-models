@@ -16,6 +16,7 @@ from models.dynamics import Dynamics, FlowMatchingDynamics
 from models.world_helpers import VisionEncoder, ActionEncoder, Reward, VisionDecoder, Termination
 import torchvision
 from models.world import World
+from models.augmentations import augment_obs
 import os
 from datetime import datetime
 from models.common import symlog, symexp
@@ -47,7 +48,7 @@ class Config:
     flow_num_euler_steps: int = 4
     flow_source_noise_sigma: float = 0.0
     flow_loss_weight: float = 0.1
-    flow_vel_cos_weight: float = 0.00
+    flow_vel_cos_weight: float = 0.02
     flow_distill_from_ar: bool = False  # If True, flow trains on AR predictions instead of encoder outputs
     flow_use_cfg: bool = False           # Master switch to enable Classifier-Free Guidance (CFG)
     flow_cfg_dropout: float = 0.15      # Probability of dropping context during flow training (CFG)
@@ -59,6 +60,14 @@ class Config:
     flow_solver_atol: float = 1e-7      # Absolute tolerance for adaptive solvers (dopri5)
     flow_sim_temperature: float = 0.1   # Temperature for cosine-similarity softmax (reward, value & termination suppression)
     flow_floor_quantile: float = 0.0    # Quantile of observed values used as suppression floor (0.0 = minimum)
+
+    # Augmentation / View Consistency
+    flow_use_shift: bool = True             # Enable spatial shift augmentation (random_shift, pad=3)
+    flow_use_color: bool = True             # Enable sequence-consistent brightness & contrast jitter
+    flow_sensor_noise: float = 0.005        # Std-dev of independent Gaussian sensor noise
+    flow_use_consistency: bool = True       # Enable view consistency loss between two augmented views
+    flow_consistency_weight: float = 0.1    # Weight of the view consistency loss term
+    flow_training_method: str = 'cfm'      # Dynamics objective: 'cfm', 'euler', or 'both'
 
     imagination_mode: str = 'flow'      # 'flow' or 'ar'
     world_backend: tuple = ('flow',)  # Active backends ('flow', 'ar')
@@ -582,21 +591,68 @@ class Trainer:
         
         B, T_act, AS = act_batch.shape
         
+        # -----------------------------------------------------------------------
+        # Augment observations for flow matching training
+        # If view consistency is enabled we need two independent augmented views.
+        # -----------------------------------------------------------------------
+        need_aug = (
+            self.cfg.flow_use_shift
+            or self.cfg.flow_use_color
+            or self.cfg.flow_sensor_noise > 0.0
+        )
+        if need_aug:
+            augmented_obs_1 = augment_obs(
+                obs_batch,
+                use_shift=self.cfg.flow_use_shift,
+                use_color=self.cfg.flow_use_color,
+                noise_std=self.cfg.flow_sensor_noise,
+            )
+            if self.cfg.flow_use_consistency:
+                augmented_obs_2 = augment_obs(
+                    obs_batch,
+                    use_shift=self.cfg.flow_use_shift,
+                    use_color=self.cfg.flow_use_color,
+                    noise_std=self.cfg.flow_sensor_noise,
+                )
+            else:
+                augmented_obs_2 = None
+        else:
+            augmented_obs_1 = obs_batch
+            augmented_obs_2 = None
+
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             (
-                raw_states, target_state, 
-                pred_next_state, pred_rewards, pred_terminals, 
+                raw_states, target_state,
+                pred_next_state, pred_rewards, pred_terminals,
                 velocity_loss, euler_full, ar_full,
-                pred_rewards_flow, pred_terminals_flow, t, z_pred_flow
+                pred_rewards_flow, pred_terminals_flow, t, z_pred_flow,
+                cfm_loss, euler_loss,
             ) = self.world(
-                act_batch, obs_batch, ctx_frames=self.cfg.imagination_ctx_frames, run_euler=log_recon,
+                act_batch, augmented_obs_1,
+                ctx_frames=self.cfg.imagination_ctx_frames, run_euler=log_recon,
                 flow_distill_from_ar=self.cfg.flow_distill_from_ar,
                 flow_standardize_latents=self.cfg.flow_standardize_latents,
                 flow_cfg_dropout=self.cfg.flow_cfg_dropout,
                 flow_cfg_scale=self.cfg.flow_cfg_scale,
                 run_flow=('flow' in self.cfg.world_backend),
                 world_training=self.cfg.world_training,
+                flow_training_method=self.cfg.flow_training_method,
             )
+
+            # ------------------------------------------------------------------
+            # View Consistency Loss — vision-encoder-only second pass
+            # We only run self.world.vision on the second augmented view to get
+            # states_2, then compute MSE against states from the first pass.
+            # This avoids re-running the full world model a second time.
+            # ------------------------------------------------------------------
+            consistency_loss = torch.tensor(0.0, device=self.device)
+            if self.cfg.flow_use_consistency and augmented_obs_2 is not None:
+                B2, T2, C2, H2, W2 = augmented_obs_2.shape
+                states_2 = self.world.vision(
+                    augmented_obs_2.reshape(B2 * T2, C2, H2, W2)
+                ).reshape(B2, T2, -1)
+                # states from first pass (raw_states) vs second pass (states_2)
+                consistency_loss = F.mse_loss(raw_states, states_2)
             
             recon_loss = None
             recon_pred_loss = None
@@ -635,6 +691,12 @@ class Trainer:
             flow_loss = self.cfg.flow_loss_weight * velocity_loss
         else:
             flow_loss = torch.tensor(0.0, device=self.device)
+            cfm_loss  = torch.tensor(0.0, device=self.device)
+            euler_loss = torch.tensor(0.0, device=self.device)
+        
+        # View consistency loss
+        if self.cfg.flow_use_consistency and consistency_loss.item() > 0.0:
+            flow_loss = flow_loss + self.cfg.flow_consistency_weight * consistency_loss
         
         # Combined dynamics loss (AR + flow)
         dyn_loss = ar_dyn_loss + flow_loss
@@ -925,6 +987,10 @@ class Trainer:
         self.writer.add_scalar('Loss/World_WM_Only', wm_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_AR_Dynamics', ar_dyn_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Flow_Velocity', flow_loss.item(), self.world_step)
+        self.writer.add_scalar('Loss/World_Flow_CFM', (self.cfg.flow_loss_weight * cfm_loss).item(), self.world_step)
+        self.writer.add_scalar('Loss/World_Flow_Euler', (self.cfg.flow_loss_weight * euler_loss).item(), self.world_step)
+        if self.cfg.flow_use_consistency:
+            self.writer.add_scalar('Loss/World_Flow_Consistency', consistency_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Dynamics', dyn_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Reward', rew_loss.item(), self.world_step)
         if loss_rew_real is not None:

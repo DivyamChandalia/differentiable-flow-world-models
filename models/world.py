@@ -75,7 +75,8 @@ class World(nn.Module):
     def forward(self, actions, observations, ctx_frames=None, run_euler=False,
                 flow_distill_from_ar=False,
                 flow_standardize_latents=True, flow_cfg_dropout=0.0,
-                flow_cfg_scale=1.0, run_flow=True, world_training=('flow', 'ar')):
+                flow_cfg_scale=1.0, run_flow=True, world_training=('flow', 'ar'),
+                flow_training_method='cfm'):
         '''
         Training forward pass with dual dynamics.
 
@@ -99,6 +100,10 @@ class World(nn.Module):
             flow_standardize_latents: bool — if True, standardize latents for flow matching
             run_flow:            bool — if True, run flow matching forward and compute loss
             world_training:      tuple/list — backends active for training reward/termination heads
+            flow_training_method: str — dynamics objective: 'cfm', 'euler', or 'both'
+                                        'cfm'  → CFM velocity matching loss only
+                                        'euler' → Euler integration MSE loss only
+                                        'both' → sum of CFM + Euler losses
 
         Returns:
             states:            (B, T, D)     all encoded states
@@ -106,11 +111,15 @@ class World(nn.Module):
             pred_next_state:   (B, T-1, D)   autoregressive predicted states (or None)
             pred_rewards:      (B, T-1, 1)   predicted rewards from AR predictions (or None)
             pred_terminals:    (B, T-1, 1)   predicted terminals from AR / target states
-            velocity_loss:     scalar         CFM velocity matching loss
+            velocity_loss:     scalar         combined flow loss (cfm, euler, or both)
             euler_full:        (B, T-1, D)   Euler-predicted states (or None)
             ar_full:           (B, T-1, D)   AR open-loop states (or None)
             pred_rewards_flow: (B, H, 1)     flow model reward predictions (or None)
             pred_terminals_flow:(B, H, 1)    flow model terminal predictions (or None)
+            t:                 (B,)           sampled CFM timesteps
+            z_pred_flow:       (B, H, D)      single-step Euler predicted states
+            cfm_loss:          scalar         CFM velocity loss (0 if method == 'euler')
+            euler_loss:        scalar         Euler integration loss (0 if method == 'cfm')
         '''
 
         B, T_act, AS = actions.shape
@@ -150,6 +159,8 @@ class World(nn.Module):
         # =====================================================================
         flow_ctx_frames = ctx_frames if (ctx_frames is not None and ctx_frames < T_act) else 1
         velocity_loss = torch.tensor(0.0, device=actions.device)
+        cfm_loss      = torch.tensor(0.0, device=actions.device)
+        euler_loss    = torch.tensor(0.0, device=actions.device)
         pred_rewards_flow = None
         pred_terminals_flow = None
         z_pred_flow = None
@@ -209,24 +220,48 @@ class World(nn.Module):
             velocity_pred = self.dynamics_flow.compute_velocity(
                 z_t, t, ctx_in, flow_future_act, drop_ctx=drop_ctx
             )
-            velocity_loss = torch.nn.functional.mse_loss(velocity_pred, velocity_target)
+
+            # ---- CFM velocity matching loss ----
+            cfm_loss_raw = torch.nn.functional.mse_loss(velocity_pred, velocity_target)
             if self.dynamics_flow.vel_cos_weight > 0.0:
                 loss_vel_cos = 1.0 - torch.nn.functional.cosine_similarity(
                     velocity_pred.flatten(1),
                     velocity_target.flatten(1),
                     dim=-1
                 ).mean()
-                velocity_loss = velocity_loss + self.dynamics_flow.vel_cos_weight * loss_vel_cos
+                cfm_loss_raw = cfm_loss_raw + self.dynamics_flow.vel_cos_weight * loss_vel_cos
+
+            # ---- Single-step Euler prediction (always needed for heads & Euler loss) ----
+            # z_pred = z_t + (1 - t) * v_theta
+            z_pred_norm = z_t + (1.0 - t_expanded) * velocity_pred
+            if flow_standardize_latents:
+                z_pred = self.latent_rms.denormalize(z_pred_norm)
+            else:
+                z_pred = z_pred_norm
+
+            # ---- Euler integration loss: MSE of predicted vs ground-truth next state ----
+            if flow_standardize_latents:
+                euler_loss_raw = torch.nn.functional.mse_loss(
+                    z_pred_norm, targets_in
+                )
+            else:
+                euler_loss_raw = torch.nn.functional.mse_loss(z_pred, flow_future_targets)
+
+            # ---- Combine based on flow_training_method ----
+            if flow_training_method == 'cfm':
+                cfm_loss    = cfm_loss_raw
+                euler_loss  = torch.tensor(0.0, device=actions.device)
+                velocity_loss = cfm_loss_raw
+            elif flow_training_method == 'euler':
+                cfm_loss    = torch.tensor(0.0, device=actions.device)
+                euler_loss  = euler_loss_raw
+                velocity_loss = euler_loss_raw
+            else:  # 'both'
+                cfm_loss    = cfm_loss_raw
+                euler_loss  = euler_loss_raw
+                velocity_loss = cfm_loss_raw + euler_loss_raw
 
             if 'flow' in world_training:
-                # Single-step Euler prediction for gradients backpropagation
-                # z_pred = z_t + (1 - t) * v_theta
-                z_pred_norm = z_t + (1.0 - t_expanded) * velocity_pred
-                if flow_standardize_latents:
-                    z_pred = self.latent_rms.denormalize(z_pred_norm)
-                else:
-                    z_pred = z_pred_norm
-
                 pred_rewards_flow = self.reward(z_pred.detach())
                 z_pred_flow = z_pred
                 if self.termination is not None:
@@ -280,10 +315,11 @@ class World(nn.Module):
                     ar_full = ar_full[:, :T_act]
 
         return (
-            states, target_state, 
-            pred_next_state, pred_rewards, pred_terminals, 
+            states, target_state,
+            pred_next_state, pred_rewards, pred_terminals,
             velocity_loss, euler_full, ar_full,
-            pred_rewards_flow, pred_terminals_flow, t, z_pred_flow
+            pred_rewards_flow, pred_terminals_flow, t, z_pred_flow,
+            cfm_loss, euler_loss,
         )
 
     def reset_cache(self):
@@ -515,7 +551,7 @@ if __name__ == "__main__":
 
         world_optimizer.zero_grad()
         
-        states, target_latents, pred_latents, pred_rewards, pred_terminals, vel_loss, _, _, _, _, _, _ = world(
+        states, target_latents, pred_latents, pred_rewards, pred_terminals, vel_loss, _, _, _, _, _, _, _, _ = world(
             batch_actions, batch_obs, ctx_frames=ctx_frames
         )
         
