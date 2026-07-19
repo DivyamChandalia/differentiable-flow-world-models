@@ -598,34 +598,54 @@ class Trainer:
         
         return mean_return
 
-    def train_world(self, batch):
+    def train_world(self, batch, skip_value=False):
         obs_batch, act_batch, rew_batch, term_batch = [b.to(self.device, non_blocking=True) for b in batch]
+
+        # Clean supervision labels — these are NEVER flipped/modified by
+        # time-symmetry augmentation so they always align with clean_states.
         if self.cfg.use_symlog:
-            sym_rew_batch = symlog(rew_batch)
+            clean_sym_rew_batch = symlog(rew_batch)
         else:
-            sym_rew_batch = rew_batch
-        
+            clean_sym_rew_batch = rew_batch
+        clean_term_batch = term_batch
+
         is_wm_frozen = self.cfg.freeze_world and (self.world_step >= self.cfg.world_bootstrap_steps)
         if is_wm_frozen:
             self.world.freeze()
         else:
             self.world.unfreeze()
         self.value_model.train()
-        
+
         log_recon = self.cfg.recon_debug and (self.world_step % self.cfg.train_steps == 0)
-        
-        B, T_act, AS = act_batch.shape
-        
+
+        B, T_obs = obs_batch.shape[:2]
+        T_act = act_batch.shape[1]
+        AS = act_batch.shape[2]
+
+        assert T_obs == T_act + 1, (
+            f"Expected one more observation than actions, "
+            f"got observations={T_obs}, actions={T_act}"
+        )
+
+        # Clean state encoding from original (unaugmented) observations.
+        # Used for reward, termination, value, and actor supervision.
+        # Dynamics uses augmented observations for data augmentation only.
+        with torch.no_grad():
+            clean_states = self.world.vision(
+                obs_batch.flatten(0, 1)
+            ).reshape(B, T_obs, -1)
+
         # -----------------------------------------------------------------------
         # Time-symmetry augmentation (50 % of steps)
-        # Applied first, before any observation-level augmentation, because it
-        # also modifies act_batch (flip + negate).  aug_act is carried through
-        # the entire forward pass so rewards/terminals still align correctly.
+        # Applied to the OBSERVATIONS and ACTIONS used for dynamics only.
+        # Rewards / terminals are NOT modified (see clean_* labels above).
         # -----------------------------------------------------------------------
-        if self.cfg.flow_use_time_sym and torch.rand(1).item() < 0.5:
+        apply_time_sym = (
+            self.cfg.flow_use_time_sym
+            and torch.rand((), device=self.device).item() < 0.5
+        )
+        if apply_time_sym:
             aug_obs_base, aug_act = time_symmetry_aug(obs_batch, act_batch)
-            sym_rew_batch = sym_rew_batch.flip(dims=[1])
-            term_batch = term_batch.flip(dims=[1])
         else:
             aug_obs_base, aug_act = obs_batch, act_batch
 
@@ -697,20 +717,20 @@ class Trainer:
             recon_pred_loss_ar = None
             if self.cfg.recon_debug:
                 if self.cfg.recon_train:
-                    recon_obs = self.world.decoder(raw_states)
+                    recon_obs = self.world.decoder(clean_states)
                 else:
-                    recon_obs = self.world.decoder(raw_states.detach())
-                    
+                    recon_obs = self.world.decoder(clean_states.detach())
+
                 recon_loss = F.mse_loss(recon_obs.float(), obs_batch.float())
                 total_recon_loss = recon_loss
-                
+
                 if log_recon and euler_full is not None:
                     if self.cfg.recon_train:
                         recon_pred_obs = self.world.decoder(euler_full)
                     else:
                         recon_pred_obs = self.world.decoder(euler_full.detach())
                     recon_pred_loss = F.mse_loss(recon_pred_obs.float(), obs_batch[:, 1:].float())
- 
+
                 if log_recon and ar_full is not None:
                     if self.cfg.recon_train:
                         recon_pred_obs_ar = self.world.decoder(ar_full)
@@ -742,69 +762,58 @@ class Trainer:
         loss_rew_real = None
         loss_rew_ar_tf = None
         loss_rew_flow = None
-        
-        # Reward training
+        loss_term_flow = None
+
+        # Reward training -- clean states / clean labels for supervision.
+        # Time-symmetry augmentation does NOT touch these labels.
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-            pred_rew_real = self.world.reward(target_state)
-            r_real = sym_rew_batch[:, 1:]
-            loss_rew_real = F.mse_loss(pred_rew_real.float(), r_real.float())
+            pred_rew_real = self.world.reward(clean_states[:, 1:])
+            reward_targets = clean_sym_rew_batch[:, 1:]
+            loss_rew_real = F.mse_loss(pred_rew_real.float(), reward_targets.float())
 
             rew_loss = self.cfg.beta_reward_real * loss_rew_real
 
             if 'ar' in self.cfg.world_training and pred_next_state is not None:
                 pred_rew_ar_tf = self.world.reward(pred_next_state)
-                loss_rew_ar_tf = F.mse_loss(pred_rew_ar_tf.float(), r_real.float())
+                loss_rew_ar_tf = F.mse_loss(pred_rew_ar_tf.float(), reward_targets.float())
                 rew_loss = rew_loss + self.cfg.beta_reward_dynamics * loss_rew_ar_tf
 
-            if 'flow' in self.cfg.world_training and pred_rewards_flow is not None and z_pred_flow is not None:
-                # Proximity-based reward suppression: cosine similarity against all real states
-                sim_rew = F.cosine_similarity(
-                    z_pred_flow.detach().unsqueeze(2),   # (B, H, 1, D)
-                    raw_states.detach().unsqueeze(1),     # (B, 1, T, D)
-                    dim=-1
-                )  # (B, H, T)
-
-                weights_rew = F.softmax(sim_rew / self.cfg.flow_sim_temperature, dim=-1)
-                r_all = sym_rew_batch.squeeze(-1).detach()  # (B, T)
-                r_weighted = (weights_rew * r_all.unsqueeze(1)).sum(dim=-1, keepdim=True)  # (B, H, 1)
-
-                # Confidence: max cosine similarity, clamped to [0, 1]
-                confidence_rew = sim_rew.max(dim=-1, keepdim=True).values.clamp(0, 1)
-
-                # Suppress to min reward floor (0.0 quantile) when far from real states
-                r_floor = sym_rew_batch.detach().float().quantile(self.cfg.flow_floor_quantile)
-                r_target_flow = (r_floor + confidence_rew * (r_weighted - r_floor)).detach()
-
-                loss_rew_flow = F.mse_loss(pred_rewards_flow.float(), r_target_flow.float())
+            # Flow-generated endpoints have valid aligned replay labels.
+            # z_pred_flow[:, h] predicts the state after the context at horizon h,
+            # which aligns with observations [start : start + H].
+            if 'flow' in self.cfg.world_training and pred_rewards_flow is not None:
+                start = self.cfg.imagination_ctx_frames
+                H = pred_rewards_flow.shape[1]
+                flow_reward_targets = clean_sym_rew_batch[:, start:start + H]
+                assert pred_rewards_flow.shape == flow_reward_targets.shape, (
+                    f"Flow reward shape mismatch: pred={pred_rewards_flow.shape}, "
+                    f"target={flow_reward_targets.shape}"
+                )
+                loss_rew_flow = F.mse_loss(pred_rewards_flow.float(), flow_reward_targets.float())
                 rew_loss = rew_loss + self.cfg.beta_reward_dynamics * loss_rew_flow
 
-        # Termination training
+        # Termination training -- clean states / clean labels for supervision.
         if self.cfg.use_termination:
             term_loss = torch.tensor(0.0, device=self.device)
             if 'ar' in self.cfg.world_training and pred_terminals is not None:
-                term_loss = term_loss + F.binary_cross_entropy_with_logits(pred_terminals.float(), term_batch[:, 1:].float())
+                term_loss = term_loss + F.binary_cross_entropy_with_logits(
+                    pred_terminals.float(), clean_term_batch[:, 1:].float())
             else:
-                # Train termination head on real encoder outputs
-                pred_term_real = self.world.termination(target_state)
-                term_loss = term_loss + F.binary_cross_entropy_with_logits(pred_term_real.float(), term_batch[:, 1:].float())
+                pred_term_real = self.world.termination(clean_states[:, 1:])
+                term_loss = term_loss + F.binary_cross_entropy_with_logits(
+                    pred_term_real.float(), clean_term_batch[:, 1:].float())
 
-            if 'flow' in self.cfg.world_training and pred_terminals_flow is not None and z_pred_flow is not None:
-                # Proximity-based termination suppression
-                sim_term = F.cosine_similarity(
-                    z_pred_flow.detach().unsqueeze(2),
-                    raw_states.detach().unsqueeze(1),
-                    dim=-1
-                )  # (B, H, T)
-
-                weights_term = F.softmax(sim_term / self.cfg.flow_sim_temperature, dim=-1)
-                term_all = term_batch.squeeze(-1).detach()  # (B, T)
-                term_weighted = (weights_term * term_all.unsqueeze(1)).sum(dim=-1, keepdim=True)  # (B, H, 1)
-
-                confidence_term = sim_term.max(dim=-1, keepdim=True).values.clamp(0, 1)
-                term_floor = term_batch.detach().float().quantile(self.cfg.flow_floor_quantile)
-                term_target_flow = (term_floor + confidence_term * (term_weighted - term_floor)).detach()
-
-                term_loss = term_loss + F.binary_cross_entropy_with_logits(pred_terminals_flow.float(), term_target_flow.float())
+            if 'flow' in self.cfg.world_training and pred_terminals_flow is not None:
+                start = self.cfg.imagination_ctx_frames
+                H = pred_terminals_flow.shape[1]
+                flow_terminal_targets = clean_term_batch[:, start:start + H]
+                assert pred_terminals_flow.shape == flow_terminal_targets.shape, (
+                    f"Flow terminal shape mismatch: pred={pred_terminals_flow.shape}, "
+                    f"target={flow_terminal_targets.shape}"
+                )
+                loss_term_flow = F.binary_cross_entropy_with_logits(
+                    pred_terminals_flow.float(), flow_terminal_targets.float())
+                term_loss = term_loss + loss_term_flow
         else:
             term_loss = torch.tensor(0.0, device=self.device)
         
@@ -814,116 +823,30 @@ class Trainer:
             sig_loss = torch.tensor(0.0, device=self.device)
             
         # --- Value Grounding Losses ---
-        # 1. Real value loss
-        ctx = self.cfg.imagination_ctx_frames
-        B_val, T_val, D_val = raw_states.shape
-        raw_states_T = raw_states.transpose(0, 1) # (T, B, D)
-        history_windows_real = self._get_history_windows(raw_states_T, ctx)
-        
-        # Predict values: (T, B, 1)
-        real_values = self.value_model(history_windows_real)
-        
-        with torch.no_grad():
-            target_real_values = self.target_value_model(history_windows_real)
-            r_real_seq_T = sym_rew_batch.transpose(0, 1) # (T, B, 1)
-            real_terminals_T = term_batch.transpose(0, 1) # (T, B, 1)
-            continuations = 1.0 - real_terminals_T.float()
-            
-            real_lambda_targets = self.value_loss_fn._compute_lambda_returns(
-                values=target_real_values,
-                rewards=r_real_seq_T[:-1],
-                pcont=continuations[:-1]
-            )
-            
-        value_real_loss = F.mse_loss(real_values[:-1], real_lambda_targets.detach())
+        value_real_loss = torch.tensor(0.0, device=self.device)
+        v_loss = torch.tensor(0.0, device=self.device)
+        if not skip_value:
+            ctx = self.cfg.imagination_ctx_frames
+            B_val, T_val, D_val = clean_states.shape
+            clean_states_T = clean_states.detach().transpose(0, 1)  # (T, B, D)
+            history_windows_real = self._get_history_windows(clean_states_T, ctx)
 
-        value_flow_loss = None
-        flow_val_confidence = None
-        if 'flow' in self.cfg.world_backend and t is not None:
-            # Reshape real history windows: (T, B, ctx, D)
-            hist_real_4d = history_windows_real.reshape(T_val, B_val, ctx, D_val)
-            
-            # Extract source and target states
-            z_src = hist_real_4d[:, :, -2]
-            z_tgt = hist_real_4d[:, :, -1]
-            
-            if self.cfg.flow_standardize_latents:
-                z_src_norm = self.world.latent_rms.normalize(z_src)
-                z_tgt_norm = self.world.latent_rms.normalize(z_tgt)
-            else:
-                z_src_norm = z_src
-                z_tgt_norm = z_tgt
-            
-            # Sample t_val for interpolation
-            t_val = torch.rand(T_val, B_val, device=self.device, dtype=z_src.dtype)
-            t_val_expanded = t_val.unsqueeze(-1) # (T, B, 1)
-            
-            # Add flow noise to source latent
-            if self.world.dynamics_flow.source_noise_sigma == 1.0:
-                z_0_val = torch.randn_like(z_src_norm)
-            elif self.world.dynamics_flow.source_noise_sigma == 0.0:
-                z_0_val = z_src_norm
-            else:
-                noise_val = torch.randn_like(z_src_norm)
-                z_0_val = z_src_norm + self.world.dynamics_flow.source_noise_sigma * noise_val
-                if self.cfg.flow_standardize_latents:
-                    z_0_val = z_0_val / ((1.0 + self.world.dynamics_flow.source_noise_sigma ** 2) ** 0.5)
-            
-            # Interpolate noisy latent state
-            z_t_norm = (1.0 - t_val_expanded) * z_0_val + t_val_expanded * z_tgt_norm
-            
-            if self.cfg.flow_standardize_latents:
-                z_t_val = self.world.latent_rms.denormalize(z_t_norm)
-            else:
-                z_t_val = z_t_norm
-            
-            # Construct noisy history window
-            hist_noisy_4d = hist_real_4d.clone()
-            hist_noisy_4d[:, :, -1] = z_t_val
-            history_windows_noisy = hist_noisy_4d.reshape(T_val, B_val, ctx * D_val)
-            
-            # ---- Proximity-based value target ----
-            # z_t_val: (T, B, D) — noisy interpolated states
-            # raw_states: (B, T_full, D) — all real encoded states
-            z_noisy_BT = z_t_val.permute(1, 0, 2).detach()  # (B, T, D)
-            z_real_BT = raw_states.detach()                   # (B, T_full, D)
+            real_values = self.value_model(history_windows_real)
 
-            sim_val = F.cosine_similarity(
-                z_noisy_BT.unsqueeze(2),  # (B, T, 1, D)
-                z_real_BT.unsqueeze(1),    # (B, 1, T_full, D)
-                dim=-1
-            )  # (B, T, T_full)
+            with torch.no_grad():
+                target_real_values = self.target_value_model(history_windows_real)
+                r_real_seq_T = clean_sym_rew_batch.transpose(0, 1)  # (T, B, 1)
+                real_terminals_T = clean_term_batch.transpose(0, 1)  # (T, B, 1)
+                pcont = 1.0 - real_terminals_T[1:].float()
 
-            weights_val = F.softmax(sim_val / self.cfg.flow_sim_temperature, dim=-1)
-            v_all = target_real_values.permute(1, 0, 2).squeeze(-1).detach()  # (B, T_full)
-            v_weighted = (weights_val * v_all.unsqueeze(1)).sum(dim=-1, keepdim=True)  # (B, T, 1)
+                real_lambda_targets = self.value_loss_fn._compute_lambda_returns(
+                    values=target_real_values,
+                    rewards=r_real_seq_T[1:],
+                    pcont=pcont,
+                )
 
-            # Confidence suppression
-            confidence_val = sim_val.max(dim=-1, keepdim=True).values.clamp(0, 1)  # (B, T, 1)
-            v_floor = target_real_values.detach().float().quantile(self.cfg.flow_floor_quantile)
-            v_target_flow = (v_floor + confidence_val * (v_weighted - v_floor)).permute(1, 0, 2).detach()  # (T, B, 1)
-            flow_val_confidence = confidence_val.mean().item()
-            
-            # Predict values from noisy windows
-            v_noisy = self.value_model(history_windows_noisy)
-            value_flow_loss = F.mse_loss(v_noisy, v_target_flow)
-
-        value_ar_loss = None
-        if 'ar' in self.cfg.world_backend and pred_next_state is not None:
-            pred_next_state_T = pred_next_state.transpose(0, 1) # (T-1, B, D)
-            hist_real_4d = history_windows_real.reshape(T_val, B_val, ctx, D_val)
-            hist_ar_4d = hist_real_4d[1:].clone()
-            hist_ar_4d[:, :, -1] = pred_next_state_T
-            history_windows_ar = hist_ar_4d.reshape(T_val - 1, B_val, ctx * D_val)
-            
-            v_ar = self.value_model(history_windows_ar)
-            value_ar_loss = F.mse_loss(v_ar, real_lambda_targets.detach())
-
-        v_loss = self.cfg.beta_real_value * value_real_loss
-        if value_flow_loss is not None:
-            v_loss = v_loss + self.cfg.beta_value_dynamics * value_flow_loss
-        if value_ar_loss is not None:
-            v_loss = v_loss + self.cfg.beta_value_dynamics * value_ar_loss
+            value_real_loss = F.smooth_l1_loss(real_values[:-1], real_lambda_targets.detach())
+            v_loss = self.cfg.beta_real_value * value_real_loss
         
         if self.cfg.recon_debug:
             wm_loss = dyn_loss + rew_loss + term_loss + total_recon_loss
@@ -985,42 +908,47 @@ class Trainer:
             recon_grad_norm = 0.0
             
         # Value Grounding Loss Grad Norm
-        self.value_opt.zero_grad(set_to_none=True)
-        self.scaler.scale(v_loss).backward(retain_graph=True)
-        v_grad_norm = self._compute_grad_norm(self.value_model) / scale_factor
+        if not skip_value:
+            self.value_opt.zero_grad(set_to_none=True)
+            self.scaler.scale(v_loss).backward(retain_graph=True)
+            v_grad_norm = self._compute_grad_norm(self.value_model) / scale_factor
+        else:
+            v_grad_norm = 0.0
             
         # Combined backward
         if not is_wm_frozen:
             self.world_opt.zero_grad(set_to_none=True)
-            self.value_opt.zero_grad(set_to_none=True)
             
             total_loss = wm_loss + v_loss
-            self.scaler.scale(total_loss).backward()
+            if skip_value:
+                self.scaler.scale(wm_loss).backward()
+            else:
+                self.value_opt.zero_grad(set_to_none=True)
+                self.scaler.scale(total_loss).backward()
             
             self.scaler.unscale_(self.world_opt)
-            self.scaler.unscale_(self.value_opt)
             grad_norm = self._compute_grad_norm(self.world)
             torch.nn.utils.clip_grad_norm_(self.world.parameters(), self.cfg.grad_clip_norm)
-            torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.cfg.grad_clip_norm)
             
             self.scaler.step(self.world_opt)
-            self.scaler.step(self.value_opt)
+            if not skip_value:
+                self.scaler.unscale_(self.value_opt)
+                torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.cfg.grad_clip_norm)
+                self.scaler.step(self.value_opt)
             self.scaler.update()
         else:
-            self.value_opt.zero_grad(set_to_none=True)
-            
             total_loss = wm_loss + v_loss
-            self.scaler.scale(v_loss).backward()
-            
-            self.scaler.unscale_(self.value_opt)
-            grad_norm = 0.0
-            torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.cfg.grad_clip_norm)
-            
-            self.scaler.step(self.value_opt)
+            if not skip_value:
+                self.value_opt.zero_grad(set_to_none=True)
+                self.scaler.scale(v_loss).backward()
+                self.scaler.unscale_(self.value_opt)
+                grad_norm = 0.0
+                torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.cfg.grad_clip_norm)
+                self.scaler.step(self.value_opt)
+            else:
+                grad_norm = 0.0
             self.scaler.update()
-        
-        self.update_value_target()
-        
+
         self.writer.add_scalar('Loss/World_Total', total_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_WM_Only', wm_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_AR_Dynamics', ar_dyn_loss.item(), self.world_step)
@@ -1035,21 +963,11 @@ class Trainer:
             self.writer.add_scalar('Loss/World_Reward_Real', loss_rew_real.item(), self.world_step)
         if loss_rew_ar_tf is not None:
             self.writer.add_scalar('Loss/World_Reward_AR', loss_rew_ar_tf.item(), self.world_step)
-        if loss_rew_flow is not None:
-            self.writer.add_scalar('Loss/World_Reward_Flow', loss_rew_flow.item(), self.world_step)
         self.writer.add_scalar('Loss/World_Termination', term_loss.item(), self.world_step)
         self.writer.add_scalar('Loss/World_SIGReg', sig_loss.item(), self.world_step)
         
         # Log value grounding losses to TensorBoard
         self.writer.add_scalar('Loss/Agent_Value_Real', value_real_loss.item(), self.world_step)
-        if value_flow_loss is not None:
-            self.writer.add_scalar('Loss/Agent_Value_Flow', value_flow_loss.item(), self.world_step)
-        if value_ar_loss is not None:
-            self.writer.add_scalar('Loss/Agent_Value_AR', value_ar_loss.item(), self.world_step)
-        if flow_val_confidence is not None:
-            self.writer.add_scalar('Proximity/Value_Confidence_Mean', flow_val_confidence, self.world_step)
-        if loss_rew_flow is not None:
-            self.writer.add_scalar('Proximity/Reward_Confidence_Mean', confidence_rew.mean().item(), self.world_step)
             
         self.writer.add_scalar('GradNorm/World_SIGReg', sig_grad_norm, self.world_step)
         self.writer.add_scalar('GradNorm/World_Termination', term_grad_norm, self.world_step)
@@ -1070,11 +988,11 @@ class Trainer:
         self.writer.add_scalar('GradNorm/World_Reward', rew_grad_norm, self.world_step)
         
         if self.cfg.recon_debug and (self.world_step % self.cfg.train_steps == 0):
-            self.visualize_reconstruction(obs_batch, raw_states, act_batch)
-            
+            self.visualize_reconstruction(obs_batch, clean_states, act_batch)
+
         self.world_step += 1
-        
-        return raw_states.detach(), act_batch.detach(), rew_batch.detach(), term_batch.detach(), wm_loss.item()
+
+        return clean_states.detach(), act_batch.detach(), rew_batch.detach(), clean_term_batch.detach(), wm_loss.item()
 
     @torch.no_grad()
     def visualize_reconstruction(self, obs_batch, raw_states, act_batch):
@@ -1494,8 +1412,6 @@ class Trainer:
         self.scaler.step(self.actor_opt)
         self.scaler.update()
 
-        self.update_value_target()
-
         self.writer.add_scalar('Loss/Agent_Value', v_loss.item(), self.agent_step)
         self.writer.add_scalar('Loss/Agent_Value_Imag', value_imag_loss.item(), self.agent_step)
         self.writer.add_scalar('Loss/Agent_Actor', a_loss.item(), self.agent_step)
@@ -1671,7 +1587,7 @@ class Trainer:
                     batch = self.buffer.sample_sequences(self.cfg.batch_size, self.cfg.max_frames)
                     if batch is None:
                         continue
-                    self.train_world(batch)
+                    self.train_world(batch, skip_value=True)
                 print("World model bootstrap complete.")
             # ────────────────────────────────────────────────────────────────
 
@@ -1696,18 +1612,22 @@ class Trainer:
                     batch = self.buffer.sample_sequences(self.cfg.batch_size, self.cfg.max_frames)
                     if batch is None: continue
                     
-                    raw_states, real_actions, real_rewards, real_terminals, wm_loss = self.train_world(batch)
+                    clean_states, real_actions, real_rewards, real_terminals, wm_loss = self.train_world(batch)
                     avg_wm_loss.append(wm_loss)
 
                     if step % world_update_freq == 0:
                         for _ in range(agent_updates_per_world):
-                            # raw_states:   (B, T,   D) — real encoded states
-                            # real_actions: (B, T-1, A) — real actions from the replay buffer
+                            # clean_states:  (B, T,   D) — real encoded states
+                            # real_actions:  (B, T-1, A) — real actions from the replay buffer
                             v_loss, a_loss = self.train_agent(
-                                raw_states, real_actions, real_rewards, real_terminals
+                                clean_states, real_actions, real_rewards, real_terminals
                             )
                             avg_v_loss.append(v_loss)
                             avg_a_loss.append(a_loss)
+
+                        # One target-network update after all value updates
+                        # for this iteration (real V + imagined V).
+                        self.update_value_target()
                     
                     self.global_step += 1
                     
