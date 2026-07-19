@@ -13,7 +13,7 @@ from envs.helpers import make_env, SubprocVecEnv
 from losses import SIGReg, WeakSIGReg, ValueLoss, ActorLoss, ReturnEMA
 from models.agent import Actor, Value
 from models.dynamics import Dynamics, FlowMatchingDynamics
-from models.world_helpers import VisionEncoder, ActionEncoder, Reward, VisionDecoder, Termination
+from models.world_helpers import VisionEncoder, DINOv3VisionEncoder, ActionEncoder, Reward, VisionDecoder, Termination
 import torchvision
 from models.world import World
 from models.augmentations import augment_obs, time_symmetry_aug
@@ -34,6 +34,10 @@ class Config:
     
     latent_dim: int = 256
     hidden_dim: int = 256
+
+    vision_encoder: str = "dinov3"  # "cnn" or "dinov3"
+    dino_model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m"
+    dino_freeze_backbone: bool = True
     
     # Autoregressive dynamics (for encoder/reward/termination training)
     dyn_num_layers: int = 6
@@ -248,7 +252,20 @@ class Trainer:
             terminate_on_limit=cfg.env_terminate_on_limit
         )
         
-        vision = VisionEncoder(latent_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim)
+        if cfg.vision_encoder == "dinov3":
+            vision = DINOv3VisionEncoder(
+                latent_dim=cfg.latent_dim,
+                hidden_dim=cfg.hidden_dim,
+                model_name=cfg.dino_model_name,
+                freeze_backbone=cfg.dino_freeze_backbone,
+            )
+        elif cfg.vision_encoder == "cnn":
+            vision = VisionEncoder(
+                latent_dim=cfg.latent_dim,
+                hidden_dim=cfg.hidden_dim,
+            )
+        else:
+            raise ValueError(f"Unknown vision encoder: {cfg.vision_encoder}")
         action_enc = ActionEncoder(action_space=self.envs.get_action_space(), hidden_dim=cfg.hidden_dim, output_dim=cfg.latent_dim)
         # Check configuration validity
         if cfg.imagination_mode == 'ar' and 'ar' not in cfg.world_backend:
@@ -318,7 +335,14 @@ class Trainer:
         self.actor_loss_fn = ActorLoss(discount=cfg.discount, batch_first=False, entropy_scale=cfg.entropy_scale, reinforce=cfg.reinforce)
         self.return_ema = ReturnEMA(decay=0.99).to(self.device) if cfg.use_return_ema else None
         
-        self.world_opt = optim.Adam(self.world.parameters(), lr=cfg.world_lr)
+        self.world_opt = optim.Adam(
+            [
+                param
+                for param in self.world.parameters()
+                if param.requires_grad
+            ],
+            lr=cfg.world_lr,
+        )
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
         self.value_opt = optim.Adam(self.value_model.parameters(), lr=cfg.value_lr)
         

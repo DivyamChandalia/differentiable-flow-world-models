@@ -54,7 +54,68 @@ class VisionEncoder(nn.Module):
         projected_output = self.norm(projected_output)
         
         return projected_output
-    
+
+
+class DINOv3VisionEncoder(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int,
+        model_name: str,
+        freeze_backbone: bool = True,
+    ):
+        super().__init__()
+
+        from transformers import AutoImageProcessor, AutoModel
+
+        self.latent_dim = latent_dim
+        self.freeze_backbone = freeze_backbone
+
+        processor = AutoImageProcessor.from_pretrained(model_name)
+        self.backbone = AutoModel.from_pretrained(model_name)
+
+        self.register_buffer(
+            "image_mean",
+            torch.tensor(processor.image_mean).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "image_std",
+            torch.tensor(processor.image_std).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+        if freeze_backbone:
+            self.backbone.requires_grad_(False)
+            self.backbone.eval()
+
+        dino_dim = self.backbone.config.hidden_size
+
+        self.projection = nn.Sequential(
+            nn.Linear(dino_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.norm = nn.LayerNorm(latent_dim)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = (x - self.image_mean) / self.image_std
+
+        if self.freeze_backbone:
+            with torch.no_grad():
+                features = self.backbone(pixel_values=x).pooler_output
+        else:
+            features = self.backbone(pixel_values=x).pooler_output
+
+        return self.norm(self.projection(features))
+
+
 class ActionEncoder(nn.Module):
     def __init__(self, action_space, hidden_dim, output_dim):
         super().__init__()

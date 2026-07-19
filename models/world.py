@@ -471,6 +471,14 @@ class World(nn.Module):
     def unfreeze(self):
         for param in self.parameters():
             param.requires_grad = True
+
+        vision = self.vision
+        if (
+            hasattr(vision, "freeze_backbone")
+            and vision.freeze_backbone
+        ):
+            vision.backbone.requires_grad_(False)
+            vision.backbone.eval()
     
     def reset(self):
         """Helper to cleanly reset the environment state."""
