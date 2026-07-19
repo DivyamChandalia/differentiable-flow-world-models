@@ -91,10 +91,11 @@ class DINOv3VisionEncoder(nn.Module):
 
         dino_dim = self.backbone.config.hidden_size
 
-        self.projection = nn.Sequential(
-            nn.Linear(dino_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, latent_dim),
+        self.projection = SwiGLUMLP(
+            input_dim=dino_dim,
+            hidden_dim=hidden_dim,
+            output_dim=latent_dim,
+            norm_fn=nn.BatchNorm1d,
         )
         self.norm = nn.LayerNorm(latent_dim)
 
