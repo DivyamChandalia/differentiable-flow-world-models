@@ -123,7 +123,7 @@ class Config:
     buffer_capacity: int = 50
     post_bootstrap_buffer_capacity: int = 50
     prefill_episodes: int = 50
-    world_bootstrap_steps: int = 500  # extra WM-only gradient steps run after prefill, before training loop
+    world_bootstrap_steps: int = 0  # extra WM-only gradient steps run after prefill, before training loop
     
     recon_debug: bool = True
     recon_train: bool = False
@@ -627,13 +627,15 @@ class Trainer:
             f"got observations={T_obs}, actions={T_act}"
         )
 
-        # Clean state encoding from original (unaugmented) observations.
-        # Used for reward, termination, value, and actor supervision.
-        # Dynamics uses augmented observations for data augmentation only.
-        with torch.no_grad():
+        if self.cfg.recon_train:
             clean_states = self.world.vision(
                 obs_batch.flatten(0, 1)
             ).reshape(B, T_obs, -1)
+        else:
+            with torch.no_grad():
+                clean_states = self.world.vision(
+                    obs_batch.flatten(0, 1)
+                ).reshape(B, T_obs, -1)
 
         # -----------------------------------------------------------------------
         # Time-symmetry augmentation (50 % of steps)
