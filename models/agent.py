@@ -146,13 +146,20 @@ class Actor(nn.Module):
         return final_action, log_prob, analytical_entropy
     
 class Value(nn.Module):
-    def __init__(self, obs_dim, hidden_dim, num_blocks=2):
+    def __init__(
+        self,
+        obs_dim,
+        hidden_dim,
+        num_blocks=2,
+        dropout_prob=0.0,
+    ):
         super().__init__()
         self.mlp = DeepResNetMLP(
             input_dim=obs_dim,
             hidden_dim=hidden_dim,
             output_dim=1,
-            num_blocks=num_blocks
+            num_blocks=num_blocks,
+            dropout_prob=dropout_prob,
         )
         self._initialize_weights()
 
@@ -173,4 +180,41 @@ class Value(nn.Module):
     def forward(self, obs):
         value = self.mlp(obs)
         return value
+
+
+class ValueEnsemble(nn.Module):
+    """
+    Independent state-value heads.
+
+    forward() returns:
+        (num_heads, *input_leading_dims, 1)
+    """
+
+    def __init__(
+        self,
+        obs_dim,
+        hidden_dim,
+        num_blocks=2,
+        num_heads=5,
+        dropout_prob=0.01,
+    ):
+        super().__init__()
+
+        self.num_heads = num_heads
+
+        self.heads = nn.ModuleList([
+            Value(
+                obs_dim=obs_dim,
+                hidden_dim=hidden_dim,
+                num_blocks=num_blocks,
+                dropout_prob=dropout_prob,
+            )
+            for _ in range(num_heads)
+        ])
+
+    def forward(self, obs):
+        return torch.stack(
+            [head(obs) for head in self.heads],
+            dim=0,
+        )
         

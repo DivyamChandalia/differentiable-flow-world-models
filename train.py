@@ -11,7 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from envs.helpers import make_env, SubprocVecEnv
 from losses import SIGReg, WeakSIGReg, ValueLoss, ActorLoss, ReturnEMA
-from models.agent import Actor, Value
+from models.agent import Actor, ValueEnsemble
 from models.dynamics import Dynamics, FlowMatchingDynamics
 from models.world_helpers import VisionEncoder, DINOv3VisionEncoder, ActionEncoder, Reward, VisionDecoder, Termination
 import torchvision
@@ -94,7 +94,10 @@ class Config:
     grad_clip_norm: float = 100.0
     use_amp: bool = True 
     amp_dtype: str = 'bfloat16' 
-    value_target_tau: float = 0.02
+    value_target_tau: float = 0.01
+    num_value_heads: int = 5
+    value_subset_size: int = 2
+    value_dropout: float = 0.01
     
     use_sigreg: bool = True
     sigreg_weight: float = 0.01
@@ -143,6 +146,14 @@ class Config:
             self.flow_cfg_dropout = 0.0
             self.flow_cfg_scale = 1.0
             
+        if self.value_subset_size < 1:
+            raise ValueError("value_subset_size must be positive")
+
+        if self.value_subset_size > self.num_value_heads:
+            raise ValueError(
+                "value_subset_size cannot exceed num_value_heads"
+            )
+
         if not self.log_dir:
             algo = "reinforce" if self.reinforce else "analytical"
             current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -320,12 +331,30 @@ class Trainer:
             self.cfg.world_horizon, decoder=decoder
         ).to(self.device)
         self.actor = Actor(action_space=self.envs.get_action_space(), obs_dim=cfg.imagination_ctx_frames * cfg.latent_dim, hidden_dim=cfg.hidden_dim, chunk_size=cfg.world_horizon, num_blocks=cfg.actor_num_blocks).to(self.device)
-        self.value_model = Value(obs_dim=cfg.imagination_ctx_frames * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
-        self.target_value_model = Value(obs_dim=cfg.imagination_ctx_frames * cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_blocks=cfg.value_num_blocks).to(self.device)
-        self.target_value_model.load_state_dict(self.value_model.state_dict())
+        value_kwargs = dict(
+            obs_dim=cfg.imagination_ctx_frames * cfg.latent_dim,
+            hidden_dim=cfg.hidden_dim,
+            num_blocks=cfg.value_num_blocks,
+            num_heads=cfg.num_value_heads,
+            dropout_prob=cfg.value_dropout,
+        )
+
+        self.value_model = ValueEnsemble(
+            **value_kwargs
+        ).to(self.device)
+
+        self.target_value_model = ValueEnsemble(
+            **value_kwargs
+        ).to(self.device)
+
+        self.target_value_model.load_state_dict(
+            self.value_model.state_dict()
+        )
+
         self.target_value_model.eval()
-        for p in self.target_value_model.parameters():
-            p.requires_grad = False
+
+        for param in self.target_value_model.parameters():
+            param.requires_grad_(False)
         
         if cfg.weak_sigreg:
             self.sig_reg = WeakSIGReg().to(self.device)
@@ -440,6 +469,61 @@ class Trainer:
         with torch.no_grad():
             for p, p_target in zip(self.value_model.parameters(), self.target_value_model.parameters()):
                 p_target.copy_(self.cfg.value_target_tau * p + (1.0 - self.cfg.value_target_tau) * p_target)
+
+    def _sample_value_heads(self):
+        """Sample a fixed subset of heads (one pair per target construction)."""
+        return torch.randperm(
+            self.cfg.num_value_heads,
+            device=self.device,
+        )[:self.cfg.value_subset_size]
+
+    def _reduce_value_heads(self, all_values, mode, head_indices=None):
+        """
+        Reduce an ensemble of value predictions.
+
+        all_values:
+            (E, ..., 1) -- symlog when cfg.use_symlog=True.
+
+        Returns:
+            (..., 1), in the same representation as the inputs.
+        """
+        if head_indices is not None:
+            all_values = all_values.index_select(0, head_indices)
+
+        if self.cfg.use_symlog:
+            raw_values = symexp(all_values)
+        else:
+            raw_values = all_values
+
+        if mode == "min":
+            reduced_raw = raw_values.min(dim=0).values
+        elif mode == "mean":
+            reduced_raw = raw_values.mean(dim=0)
+        else:
+            raise ValueError(
+                f"Unknown value reduction mode: {mode}"
+            )
+
+        if self.cfg.use_symlog:
+            return symlog(reduced_raw)
+
+        return reduced_raw
+
+    def _value_ensemble_loss(self, all_values, targets):
+        """
+        Regress every online head against the same conservative target.
+
+        all_values:
+            (E, H+1, B, 1)
+        targets:
+            (H, B, 1)
+        """
+        predictions = all_values[:, :-1]
+        expanded_targets = targets.unsqueeze(0).expand_as(predictions)
+        return F.smooth_l1_loss(
+            predictions,
+            expanded_targets.detach(),
+        )
     
     def _get_history_windows(self, states, horizon, context=None):
         # states shape: (Seq, B, D)
@@ -833,22 +917,60 @@ class Trainer:
             clean_states_T = clean_states.detach().transpose(0, 1)  # (T, B, D)
             history_windows_real = self._get_history_windows(clean_states_T, ctx)
 
-            real_values = self.value_model(history_windows_real)
+            real_values_all = self.value_model(history_windows_real)
+            # (E, T, B, 1)
 
             with torch.no_grad():
-                target_real_values = self.target_value_model(history_windows_real)
-                r_real_seq_T = clean_sym_rew_batch.transpose(0, 1)  # (T, B, 1)
-                real_terminals_T = clean_term_batch.transpose(0, 1)  # (T, B, 1)
-                pcont = 1.0 - real_terminals_T[1:].float()
+                target_values_all = self.target_value_model(history_windows_real)
+                # (E, T, B, 1)
+
+                critic_indices = self._sample_value_heads()
+
+                conservative_target_values = self._reduce_value_heads(
+                    target_values_all,
+                    mode="min",
+                    head_indices=critic_indices,
+                )
+                # (T, B, 1)
+
+                rewards_T = clean_sym_rew_batch.transpose(0, 1)
+                terminals_T = clean_term_batch.transpose(0, 1)
 
                 real_lambda_targets = self.value_loss_fn._compute_lambda_returns(
-                    values=target_real_values,
-                    rewards=r_real_seq_T[1:],
-                    pcont=pcont,
+                    values=conservative_target_values,
+                    rewards=rewards_T[1:],
+                    pcont=1.0 - terminals_T[1:].float(),
                 )
 
-            value_real_loss = F.smooth_l1_loss(real_values[:-1], real_lambda_targets.detach())
+            value_real_loss = self._value_ensemble_loss(
+                real_values_all,
+                real_lambda_targets,
+            )
             v_loss = self.cfg.beta_real_value * value_real_loss
+
+            with torch.no_grad():
+                real_raw = (
+                    symexp(real_values_all)
+                    if self.cfg.use_symlog
+                    else real_values_all
+                )
+                real_ensemble_std = real_raw.std(dim=0).mean()
+                real_all_mean = real_raw.mean(dim=0)
+                real_pair_min = self._reduce_value_heads(
+                    target_values_all, mode="min", head_indices=critic_indices
+                )
+                real_pair_min_raw = (
+                    symexp(real_pair_min) if self.cfg.use_symlog else real_pair_min
+                )
+                real_conservative_gap = (real_all_mean - real_pair_min_raw).mean()
+                self.writer.add_scalar(
+                    'Value/Real_EnsembleStd', real_ensemble_std.item(), self.world_step
+                )
+                self.writer.add_scalar(
+                    'Value/Real_ConservativeGap',
+                    real_conservative_gap.item(),
+                    self.world_step,
+                )
         
         if self.cfg.recon_debug:
             wm_loss = dyn_loss + rew_loss + term_loss + total_recon_loss
@@ -1060,6 +1182,7 @@ class Trainer:
             flow_windows = self._get_history_windows(euler_pred.transpose(0, 1), self.cfg.imagination_ctx_frames, context=ctx_states)
             with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 flow_vals_raw = self.value_model(flow_windows)
+                flow_vals_raw = self._reduce_value_heads(flow_vals_raw, mode="mean")
                 if self.cfg.use_symlog:
                     flow_vals_raw = symexp(flow_vals_raw)
                 flow_values = flow_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()
@@ -1073,6 +1196,7 @@ class Trainer:
         enc_windows = self._get_history_windows(states_idx, self.cfg.imagination_ctx_frames, context=None)
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             enc_vals_raw = self.value_model(enc_windows)
+            enc_vals_raw = self._reduce_value_heads(enc_vals_raw, mode="mean")
             if self.cfg.use_symlog:
                 enc_vals_raw = symexp(enc_vals_raw)
             enc_values = enc_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()[ctx:]
@@ -1082,6 +1206,7 @@ class Trainer:
             ar_windows = self._get_history_windows(ar_aligned_states.transpose(0, 1), self.cfg.imagination_ctx_frames, context=ctx_states)
             with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 ar_vals_raw = self.value_model(ar_windows)
+                ar_vals_raw = self._reduce_value_heads(ar_vals_raw, mode="mean")
                 if self.cfg.use_symlog:
                     ar_vals_raw = symexp(ar_vals_raw)
                 ar_values = ar_vals_raw.squeeze(-1).squeeze(-1).float().cpu().numpy()
@@ -1311,35 +1436,59 @@ class Trainer:
 
             history_windows = self._get_history_windows(imagined_states, self.cfg.imagination_ctx_frames, context=ctx_windows)
 
-            imagined_values = self.value_model(history_windows)
-            
-            # EMA values — differentiable w.r.t. inputs (gradient flows through
-            # imagined_states to actor), but target model params are frozen.
-            ema_imagined_values = self.target_value_model(history_windows)
-                
             pred_term_probs = torch.sigmoid(imagined_terminals)
             pcont = (1.0 - pred_term_probs).detach()
-            
-            value_imag_loss, targets_v = self.value_loss_fn(
-                imagined_values, 
-                imagined_rewards, 
-                pcont=pcont, 
-                target_values=ema_imagined_values.detach()  # fully detached for value bootstrap
-            )
 
-            # --- 1. Combined Value Loss ---
+            imagined_values_all = self.value_model(history_windows)
+            # (E, H+1, B, 1)
+
+            # EMA target values — differentiable w.r.t. inputs (gradient flows
+            # through imagined_states to actor), but target params are frozen.
+            with torch.no_grad():
+                target_values_all = self.target_value_model(history_windows)
+                # (E, H+1, B, 1)
+
+                critic_indices = self._sample_value_heads()
+
+                conservative_bootstrap = self._reduce_value_heads(
+                    target_values_all,
+                    mode="min",
+                    head_indices=critic_indices,
+                )
+                # (H+1, B, 1)
+
+                targets_v = self.value_loss_fn._compute_lambda_returns(
+                    values=conservative_bootstrap,
+                    rewards=imagined_rewards,
+                    pcont=pcont,
+                )
+
+            # --- 1. Combined Value Loss (all heads vs common conservative target) ---
+            value_imag_loss = self._value_ensemble_loss(
+                imagined_values_all,
+                targets_v,
+            )
             v_loss = self.cfg.beta_imag_value * value_imag_loss
 
-            # Compute actor targets using the EMA value model (more stable estimates)
+            # Actor target: average of random two ONLINE heads (differentiable).
+            actor_indices = self._sample_value_heads()
+
+            actor_bootstrap_values = self._reduce_value_heads(
+                imagined_values_all,
+                mode="mean",
+                head_indices=actor_indices,
+            )
+            # (H+1, B, 1)
+
             targets_a = self.value_loss_fn._compute_lambda_returns(
-                ema_imagined_values,
-                imagined_rewards,
-                pcont
+                values=actor_bootstrap_values,
+                rewards=imagined_rewards,
+                pcont=pcont,
             )
 
             # Optionally compute advantages (returns - value baseline) for contrastive signal
             if self.cfg.use_advantage or self.cfg.reinforce:
-                actor_targets = targets_a - imagined_values[:-1]
+                actor_targets = targets_a - actor_bootstrap_values[:-1]
             else:
                 actor_targets = targets_a
             
@@ -1416,6 +1565,30 @@ class Trainer:
 
         self.writer.add_scalar('Loss/Agent_Value', v_loss.item(), self.agent_step)
         self.writer.add_scalar('Loss/Agent_Value_Imag', value_imag_loss.item(), self.agent_step)
+
+        with torch.no_grad():
+            imag_raw = (
+                symexp(imagined_values_all)
+                if self.cfg.use_symlog
+                else imagined_values_all
+            )
+            imag_ensemble_std = imag_raw.std(dim=0).mean()
+            imag_all_mean = imag_raw.mean(dim=0)
+            imag_pair_min = self._reduce_value_heads(
+                target_values_all, mode="min", head_indices=critic_indices
+            )
+            imag_pair_min_raw = (
+                symexp(imag_pair_min) if self.cfg.use_symlog else imag_pair_min
+            )
+            imag_conservative_gap = (imag_all_mean - imag_pair_min_raw).mean()
+            self.writer.add_scalar(
+                'Value/Imag_EnsembleStd', imag_ensemble_std.item(), self.agent_step
+            )
+            self.writer.add_scalar(
+                'Value/Imag_ConservativeGap',
+                imag_conservative_gap.item(),
+                self.agent_step,
+            )
         self.writer.add_scalar('Loss/Agent_Actor', a_loss.item(), self.agent_step)
         self.writer.add_scalar('Loss/Agent_Actor_Target', a_target_loss.item(), self.agent_step)
         self.writer.add_scalar('Loss/Agent_Actor_Entropy', a_entropy_loss.item(), self.agent_step)
