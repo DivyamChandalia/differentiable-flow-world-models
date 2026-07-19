@@ -600,6 +600,8 @@ class Trainer:
         # -----------------------------------------------------------------------
         if self.cfg.flow_use_time_sym and torch.rand(1).item() < 0.5:
             aug_obs_base, aug_act = time_symmetry_aug(obs_batch, act_batch)
+            sym_rew_batch = sym_rew_batch.flip(dims=[1])
+            term_batch = term_batch.flip(dims=[1])
         else:
             aug_obs_base, aug_act = obs_batch, act_batch
 
