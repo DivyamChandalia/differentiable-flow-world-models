@@ -803,12 +803,12 @@ class Trainer:
             target_real_values = self.target_value_model(history_windows_real)
             r_real_seq_T = sym_rew_batch.transpose(0, 1) # (T, B, 1)
             real_terminals_T = term_batch.transpose(0, 1) # (T, B, 1)
-            discounts = self.cfg.discount * (1.0 - real_terminals_T.float())
+            continuations = 1.0 - real_terminals_T.float()
             
             real_lambda_targets = self.value_loss_fn._compute_lambda_returns(
                 values=target_real_values,
                 rewards=r_real_seq_T[:-1],
-                pcont=discounts[:-1]
+                pcont=continuations[:-1]
             )
             
         value_real_loss = F.mse_loss(real_values[:-1], real_lambda_targets.detach())
