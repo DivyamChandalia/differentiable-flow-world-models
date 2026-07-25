@@ -72,7 +72,7 @@ class Config:
     flow_use_consistency: bool = False      # Enable view consistency loss between two augmented views
     flow_consistency_weight: float = 0.001   # Weight of the view consistency loss term
     flow_training_method: str = 'cfm'       # Dynamics objective: 'cfm', 'euler', or 'both'
-    flow_use_time_sym: bool = False           # Apply time-reversal aug (50 % of steps): reverses frames & negates actions
+    flow_use_time_sym: bool = True           # Apply time-reversal aug (50 % of steps): reverses frames & negates actions
 
     imagination_mode: str = 'flow'      # 'flow' or 'ar'
     world_backend: tuple = ('flow',)  # Active backends ('flow', 'ar')
