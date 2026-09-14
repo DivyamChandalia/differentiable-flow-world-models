@@ -136,8 +136,12 @@ class LossLandscapeVisualizer:
             )
 
             history_windows = trainer._get_history_windows(imagined_states, cfg.imagination_ctx_frames, context=ctx_windows)
-            ema_imagined_values = trainer.target_value_model(history_windows)
-            imagined_values = trainer.value_model(history_windows)
+            ema_imagined_values = trainer._reduce_value_heads(
+                trainer.target_value_model(history_windows), mode="mean"
+            )
+            imagined_values = trainer._reduce_value_heads(
+                trainer.value_model(history_windows), mode="mean"
+            )
 
             pred_term_probs = torch.sigmoid(imagined_terminals)
             pcont = (1.0 - pred_term_probs)
@@ -321,8 +325,12 @@ class LossLandscapeVisualizer:
             )
 
             history_windows = trainer._get_history_windows(imagined_states, cfg.imagination_ctx_frames, context=ctx_windows)
-            ema_imagined_values = trainer.target_value_model(history_windows)
-            imagined_values = trainer.value_model(history_windows)
+            ema_imagined_values = trainer._reduce_value_heads(
+                trainer.target_value_model(history_windows), mode="mean"
+            )
+            imagined_values = trainer._reduce_value_heads(
+                trainer.value_model(history_windows), mode="mean"
+            )
 
             pred_term_probs = torch.sigmoid(imagined_terminals)
             pcont = (1.0 - pred_term_probs).detach()

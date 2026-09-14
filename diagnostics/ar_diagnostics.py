@@ -13,12 +13,21 @@ class ARDiagnostics:
         self.device = trainer.device
 
     def fit_pca(self, states, q=2):
-        """Fit a linear PCA projection onto 2D using PyTorch SVD."""
+        """Fit a linear PCA projection onto 2D using PyTorch SVD.
+
+        Returns:
+            mean: (1, D) tensor
+            V: (D, q) projection matrix
+            explained_ratio: scalar tensor, fraction of total variance
+                captured by the first q principal components.
+        """
         states = states.float()
         mean = states.mean(dim=0, keepdim=True)
         states_centered = states - mean
         U, S, V = torch.pca_lowrank(states_centered, q=q)
-        return mean, V
+        total_var = states_centered.pow(2).sum()
+        explained_ratio = (S[:q] ** 2).sum() / total_var.clamp(min=1e-12)
+        return mean, V, explained_ratio
 
     @torch.no_grad()
     def collect_ar_data(self, start_states, real_actions):
@@ -92,7 +101,7 @@ class ARDiagnostics:
                 traj_opposite[i]
             ]
             pts_tensor = torch.cat(pts, dim=0)
-            mean, V = self.fit_pca(pts_tensor, q=2)
+            mean, V, explained_ratio = self.fit_pca(pts_tensor, q=2)
 
             sequences.append({
                 'ctx_proj': (ctx_windows[i].float() - mean) @ V,
@@ -101,6 +110,7 @@ class ARDiagnostics:
                 'traj_zero_proj': (traj_zero[i].float() - mean) @ V,
                 'traj_rand_proj': (traj_rand[i].float() - mean) @ V,
                 'traj_opposite_proj': (traj_opposite[i].float() - mean) @ V,
+                'explained_ratio': explained_ratio.item(),
             })
 
         # Calculate batch-wide metrics
@@ -186,7 +196,8 @@ class ARDiagnostics:
 
             ax.set_xlabel('PCA Dim 1')
             ax.set_ylabel('PCA Dim 2')
-            ax.set_title(f'Seq {i} - Autoregressive Action Steering (H={H})')
+            evr = seq_data.get('explained_ratio', 0.0)
+            ax.set_title(f'Seq {i} - Autoregressive Action Steering (H={H}) | PCA var={evr*100:.1f}%')
             ax.grid(True, alpha=0.3)
             if i == 0:
                 ax.legend()
