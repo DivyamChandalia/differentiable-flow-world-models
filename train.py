@@ -35,7 +35,7 @@ class Config:
     latent_dim: int = 256
     hidden_dim: int = 256
 
-    vision_encoder: str = "dinov3"  # "cnn" or "dinov3"
+    vision_encoder: str = "cnn"  # "cnn" or "dinov3"
     dino_model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m"
     dino_freeze_backbone: bool = True
     
