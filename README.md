@@ -80,9 +80,10 @@ flowchart LR
     FM --> R
     V --> SIG["WeakSIGReg<br/>Cov(z) ~ I"]
     subgraph Imagine
-        C["ctx z (3 frames)"] + A["Actor chunk (H actions)"] --> FM
+        C["ctx z (3 frames)"] --> FM
+        A["Actor chunk (H actions)"] --> FM
         FM --> RI["imagined z, r, done"]
-        RI --> VE["ValueEnsemble (5 heads)<br/>λ-returns, symlog"]
+        RI --> VE["ValueEnsemble (5 heads)<br/>lambda-returns, symlog"]
         VE --> AL["ActorLoss<br/>analytical or REINFORCE + entropy"]
         AL --> A
     end
