@@ -1,20 +1,33 @@
-# LEWM — Latent Evolution World Model
+# Differentiable Flow World Models
 
-> **Vision-first, Dreamer-style visual control with Flow-Matching imagination.**
-> Learn a latent world from pixels, then train the actor *inside* imagined rollouts by backpropagating straight through the dynamics.
+> **LEWM — Latent Evolution World Model.**
+> Experimental visual-control framework for studying policy optimization through differentiable flow-matching world models.
+
+> **Can chunk-wise flow-matching world models provide useful policy gradients without the instability of long autoregressive BPTT?**
+>
+> Differentiable Flow World Models explores visual control by generating short latent future chunks with conditional flow matching and optimizing a Transformer policy by backpropagating λ-returns through the learned dynamics.
 
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c?logo=pytorch)](https://pytorch.org/)
 [![Env: DeepMind Control](https://img.shields.io/badge/env-DeepMind_Control_Suite-blue)](https://www.dmc-mujoco.com/)
 [![Status: Research / Experimental](https://img.shields.io/badge/status-experimental-orange)]()
 [![Diagnostics: Heavy](https://img.shields.io/badge/diagnostics-loss_landscape_+_grad_flow_+_flow_viz-green)]()
 
-**TL;DR:** `train.py` collects Cartpole pixels into an episodic replay buffer, trains a dual-dynamics latent world (autoregressive Transformer + conditional Flow-Matching), then trains a Transformer chunk-actor + TD-MPC2-style value ensemble by differentiating through imagination. It works well enough to learn the world — the actor is still the hard part. This README documents the vision, what works, every major failure, and how to reproduce / debug it.
+**TL;DR:** Differentiable Flow World Models investigates whether conditional flow matching can replace long autoregressive imagination when optimizing policies through a learned visual world model. A Transformer policy outputs action chunks, the world model generates corresponding latent futures, and λ-return gradients are backpropagated through those imagined trajectories. Short-horizon dynamics became predictable, but weak action conditioning and poor held-out generalization made the resulting analytical policy gradients unreliable. This repository documents the architectures, ablations, diagnostics, and failure modes explored along the way.
+
+## Key findings
+
+- Chunk-wise flow matching removed the need for an H-step sequential autoregressive rollout during imagination.
+- Short-horizon latent predictions became plausible under the Cartpole setup.
+- Learned dynamics remained weakly conditioned on actions and generalized poorly to held-out trajectories.
+- As a result, analytical gradients through imagined trajectories were often poorly aligned with useful policy-improvement directions.
+- Several attempted fixes — including longer horizons, alternative ODE solvers, entropy sweeps, DINOv3 features, and different value-learning schemes — did not resolve the underlying action-conditioning problem.
 
 ---
 
 ## Table of contents
 
-- [1. Vision](#1-vision)
+- [Key findings](#key-findings)
+- [1. Motivation](#1-motivation--why-flow-based-imagination)
 - [2. How it works (30 seconds)](#2-how-it-works-30-seconds)
 - [3. Repo layout](#3-repo-layout)
 - [4. Quickstart](#4-quickstart)
@@ -31,19 +44,19 @@
 
 ---
 
-## 1. Vision — why world-model gradients?
+## 1. Motivation — why flow-based imagination?
 
 Most Dreamer-style systems use the world model as a **proxy simulator**: roll out latent trajectories, then update the actor with a critic / REINFORCE objective that treats dynamics as a black-box data generator.
 
-> **LEWM's thesis: the dynamics themselves should be a differentiable policy teacher.** If `d(return)/d(action)` can flow *through* `d(dynamics)/d(action)`, the actor gets dense, per-timestep feedback instead of a scalar score.
+> **Research hypothesis:** generating future states as short flow-matched chunks may provide more stable long-horizon policy gradients than repeatedly backpropagating through an autoregressive dynamics model. If `d(return)/d(action)` can flow *through* `d(dynamics)/d(action)`, the actor gets dense, per-timestep feedback instead of a scalar score.
 
-Note on Dreamer (verified): DreamerV1 backprops analytic value gradients through latent dynamics; DreamerV2/V3 keep stochastic backprop / reparameterization gradients for continuous actions and use REINFORCE for discrete actions (see DreamerV1 §Action model, DreamerV3 §Actor Learning, `torchrl.objectives.DreamerV3ActorLoss`). So the analytical path exists — LEWM just pushes it to the extreme: make the *whole imagination operator* differentiable and stable enough that its gradients are actually usable.
+Note on Dreamer (verified): DreamerV1 backprops analytic value gradients through latent dynamics; DreamerV2/V3 keep stochastic backprop / reparameterization gradients for continuous actions and use REINFORCE for discrete actions (see DreamerV1 §Action model, DreamerV3 §Actor Learning, `torchrl.objectives.DreamerV3ActorLoss`). So the analytical path exists — this project pushes it further: make the *whole imagination operator* differentiable and stable enough that its gradients are actually usable.
 
-Note on DreamerV4 (Hafner et al., `Training Agents Inside of Scalable World Models`, arXiv:2509.24527, Sep 2025): V4 replaces the RSSM/GRU with an efficient Transformer video world model trained with flow-matching + shortcut forcing, runs real-time on a single GPU, learns mostly from unlabeled video with little action-labeled data, and solves Minecraft diamonds purely offline in imagination. This validates LEWM's flow bet — but also sharpens the gap: V4 fixes weak action-conditioning with web-scale video + scale, while LEWM tests whether the same idea can survive on 50 Cartpole episodes under 4 GB VRAM.
+Note on DreamerV4 (Hafner et al., `Training Agents Inside of Scalable World Models`, arXiv:2509.24527, Sep 2025): V4 replaces the RSSM/GRU with an efficient Transformer video world model trained with flow-matching + shortcut forcing, runs real-time on a single GPU, learns mostly from unlabeled video with little action-labeled data, and solves Minecraft diamonds purely offline in imagination. This validates the flow-modeling direction — but also sharpens the gap: V4 fixes weak action-conditioning with web-scale video + scale, while this project tests whether the same idea can survive on 50 Cartpole episodes under 4 GB VRAM.
 
 Why this is hard with autoregressive (AR) dynamics — all three tried here:
 
-1. **Full BPTT through AR chain → chaos.** Unrolling `z_{t+1}=f(z_t,a_t)` for H steps and backpropping compounds Jacobians. Small dynamics errors blow up into chaotic actor gradients. Tried, exploded.
+1. **Full BPTT through AR dynamics → unstable long-horizon gradients.** Unrolling `z_{t+1}=f(z_t,a_t)` for H steps and backpropping compounds Jacobians. Small dynamics errors accumulate into unstable actor gradients. Repeated Jacobian products produced unstable actor gradients at longer horizons.
 2. **Disconnected / stop-grad per step → too local.** Detaching each step stabilises training but each action only sees its immediate reward. No long-horizon credit. Tried, too myopic.
 3. **Single-pass chunk generation → too hard to learn.** Predicting `[z_{t+1}..z_{t+H}]` in one forward pass removes BPTT, but the mapping is highly non-linear and the model never learned it. Tried, failed.
 
@@ -60,9 +73,9 @@ Concretely we want:
   - `Dynamics` (AR Transformer): teacher-forced training, grounds the encoder / reward / termination heads.
   - `FlowMatchingDynamics`: learns `v_θ(z_t, t | ctx, actions)` that transports `last_context_state → future_states` in parallel. Used for actor imagination.
 - **Actor learns from imagination, not just real steps:** Transformer chunk-policy outputs `H` actions, world imagines `H` latents/rewards, λ-returns + entropy give an analytical loss. REINFORCE path kept as a reference.
-- **Diagnose everything:** if analytical gradients lie, we want to *see* it — loss landscapes, finite-difference checks, per-layer grad norms, bang-bang monitors, PCA/flow trajectory plots, OOD comparisons.
+- **Diagnose everything:** if analytical gradients are poorly aligned with the local objective, we want to *see* it — loss landscapes, finite-difference checks, per-layer grad norms, bang-bang monitors, PCA/flow trajectory plots, OOD comparisons.
 
-Testbed is deliberately narrow: **DMC Cartpole `swingup` / `balance` from 64×64 pixels**, 5 parallel envs, horizon 3–15, **4 GB VRAM, ~50-episode buffer**. If it doesn't work here, it won't scale — and the small-data regime is itself the stress test (see §8, §13).
+Testbed is deliberately narrow: **DMC Cartpole `swingup` / `balance` from 64×64 pixels**, 5 parallel envs, horizon 3–15, **4 GB VRAM, ~50-episode buffer**. The deliberately constrained Cartpole setup serves as a controlled stress test for representation quality, action conditioning, and gradient stability under limited data and compute (see §8, §13).
 
 ---
 
@@ -191,7 +204,7 @@ Agent training:
 ## 6. What works ✅
 
 - **World model trains.** Recon MSE drops, decoder visualisations track the pole, Euler and AR open-loop predictions are plausible for short horizons (`H=3`). This was *not* true at the start — see §8.
-- **Flow matching is fast and parallel.** 4 Euler steps generate a whole chunk; imagination no longer scales linearly with `H` like AR.
+- **Flow matching is fast and parallel.** 4 Euler steps generate a whole chunk; flow matching predicts the future chunk in parallel across the horizon, avoiding H sequential autoregressive dynamics evaluations.
 - **AR grounding stabilises representation.** Keeping a teacher-forced AR backend purely to train encoder/reward/term was one of the few unambiguous wins (dual-dynamics in `856b7ab`).
 - **WeakSIGReg > SIGReg.** Full Epps-Pulley SIGReg was expensive and finicky; Frobenius `‖Cov−I‖` gives a spherical latent cloud for ~zero cost and is now the default (`weak_sigreg=True`).
 - **Value ensemble helps.** TD-MPC2-style 5 heads, 2-sample min target, symlog + Huber loss killed the worst overestimation spikes. Single-head value was consistently optimistic.
@@ -223,7 +236,7 @@ Agent training:
 | 11 | High entropy `0.03` to cure bang-bang | Prevents saturation but policy stays random | **Failed** — `0.006` is a compromise, not a fix |
 | 12 | DINOv3 as drop-in replacement | Trains, but no win on 64×64 Cartpole, heavier + OOD quirks | **Neutral** |
 | 13 | Time-symmetry on rewards/terms | Physically wrong (reward is not symmetric) | **Failed** — now applied to obs/act only, labels kept clean |
-| 14 | Single value head + MSE | Optimistic, spikes, actor chases phantom returns | **Replaced** by ensemble |
+| 14 | Single value head + MSE | Optimistic, spikes, actor exploits overestimated imagined returns | **Replaced** by ensemble |
 | 15 | LayerNorm in vision projection | Dead latents on small batches | **Replaced** by BatchNorm1d |
 
 **Blunt summary:** the world learns to *predict*; the actor hasn't learned to *act* reliably. Swingup returns plateau far below model-free baselines, and many runs end in tanh saturation (bang-bang).
@@ -277,7 +290,7 @@ Condensed from `git log` (oldest → newest). Each line was a hypothesis:
 - `eb60406` Transformer actor + value-MSE experiment
 - `5bc45c9` fixed AR train/infer mismatch + added loss-landscape diagnostics
 - `792266a` replaced Transformer dynamics with flow matching
-- `a6e8581` reward/term on targets, not Euler garbage
+- `a6e8581` reward/termination heads trained on inaccurate early Euler predictions moved to encoder targets
 - `66fe00a` documented trajectory collapse → `87deeef` fixed mode averaging
 - `856b7ab` dual dynamics (AR grounds, flow imagines)
 - `3a4964c` CFG + latent standardisation → `444a1f8` fixed disconnected init → `c78b5a9` fixed causal leakage
@@ -389,4 +402,4 @@ Built on DeepMind Control Suite, PyTorch, and ideas from DreamerV3 (RSSM → lat
 
 ---
 
-*This README is intentionally honest: the world model works, the actor doesn't — yet. If you fix §7 row 1, please update this file first.*
+*This repository documents both successful components and unresolved failure modes. Short-horizon world prediction became workable, but reliable action-conditioned imagination and policy optimization remain open problems. If you fix §7 row 1, please update this file first.*
