@@ -71,20 +71,20 @@ Testbed is deliberately narrow: **DMC Cartpole `swingup` / `balance` from 64×64
 ```mermaid
 flowchart LR
     subgraph Real
-        E["DMC Cartpole<br/>5x SubprocVecEnv"] --> B["EpisodeReplayBuffer<br/>50 eps, seq len 6"]
+        E["DMC Cartpole, 5x SubprocVecEnv"] --> B["EpisodeReplayBuffer, 50 eps, seq len 6"]
     end
-    B --> V["Vision: CNN / DINOv3<br/>-> z (256-D)"]
-    V --> AR["AR Dynamics<br/>teacher-forced MSE"]
-    V --> FM["Flow Dynamics<br/>CFM + Euler MSE"]
-    AR --> R["Reward / Term heads"]
+    B --> V["Vision CNN or DINOv3 to z 256-D"]
+    V --> AR["AR Dynamics, teacher-forced MSE"]
+    V --> FM["Flow Dynamics, CFM plus Euler MSE"]
+    AR --> R["Reward and Term heads"]
     FM --> R
-    V --> SIG["WeakSIGReg<br/>Cov(z) ~ I"]
+    V --> SIG["WeakSIGReg, Cov z approx I"]
     subgraph Imagine
-        C["ctx z (3 frames)"] --> FM
-        A["Actor chunk (H actions)"] --> FM
+        C["ctx z, 3 frames"] --> FM
+        A["Actor chunk, H actions"] --> FM
         FM --> RI["imagined z, r, done"]
-        RI --> VE["ValueEnsemble (5 heads)<br/>lambda-returns, symlog"]
-        VE --> AL["ActorLoss<br/>analytical or REINFORCE + entropy"]
+        RI --> VE["ValueEnsemble 5 heads, lambda-returns, symlog"]
+        VE --> AL["ActorLoss, analytical or REINFORCE plus entropy"]
         AL --> A
     end
 ```
