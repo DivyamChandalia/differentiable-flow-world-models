@@ -68,10 +68,11 @@ Why this is hard with autoregressive (AR) dynamics — all three tried here:
 
 Concretely we want:
 
+- **JEPA representation:** a vision encoder maps pixels → latents; predictor heads regress those latents against stop-grad encoder targets, so the representation is learned by latent prediction, not pixel reconstruction. `SIGReg` / `WeakSIGReg` (`‖Cov(z)−I‖_F`) acts as the anti-collapse regularizer. The pixel decoder is debug-only and excluded from the representation objective.
 - **Pixels in, latents out:** tiny CNN (default) or frozen DINOv3 backbone → 256-D latent.
-- **Two dynamics, two jobs:**
-  - `Dynamics` (AR Transformer): teacher-forced training, grounds the encoder / reward / termination heads.
-  - `FlowMatchingDynamics`: learns `v_θ(z_t, t | ctx, actions)` that transports `last_context_state → future_states` in parallel. Used for actor imagination.
+- **Two predictors, two jobs:**
+  - `Dynamics` (AR Transformer predictor): teacher-forced next-latent prediction against detached encoder targets, grounds the encoder / reward / termination heads.
+  - `FlowMatchingDynamics` (flow predictor): learns `v_θ(z_t, t | ctx, actions)` that transports `last_context_state → future_states` in parallel. Used for actor imagination.
 - **Actor learns from imagination, not just real steps:** Transformer chunk-policy outputs `H` actions, world imagines `H` latents/rewards, λ-returns + entropy give an analytical loss. REINFORCE path kept as a reference.
 - **Diagnose everything:** if analytical gradients are poorly aligned with the local objective, we want to *see* it — loss landscapes, finite-difference checks, per-layer grad norms, bang-bang monitors, PCA/flow trajectory plots, OOD comparisons.
 
@@ -86,12 +87,12 @@ flowchart LR
     subgraph Real
         E["DMC Cartpole, 5x SubprocVecEnv"] --> B["EpisodeReplayBuffer, 50 eps, seq len 6"]
     end
-    B --> V["Vision CNN or DINOv3 to z 256-D"]
-    V --> AR["AR Dynamics, teacher-forced MSE"]
-    V --> FM["Flow Dynamics, CFM plus Euler MSE"]
+    B --> V["Vision encoder, CNN or DINOv3 to z 256-D"]
+    V --> AR["AR Predictor, teacher-forced latent MSE"]
+    V --> FM["Flow Predictor, CFM plus Euler MSE"]
     AR --> R["Reward and Term heads"]
     FM --> R
-    V --> SIG["WeakSIGReg, Cov z approx I"]
+    V --> SIG["WeakSIGReg anti-collapse, Cov z approx I"]
     subgraph Imagine
         C["ctx z, 3 frames"] --> FM
         A["Actor chunk, H actions"] --> FM
@@ -107,7 +108,7 @@ Training loop (`train.py:Trainer`):
 1. **Prefill** 50 random episodes → **100 world-only bootstrap steps**.
 2. Repeat 500 epochs:
    - collect 1 episode per env,
-   - `train_world()`: dynamics + reward + termination + SIGReg + recon-debug + real-value grounding,
+    - `train_world()`: JEPA latent prediction, AR plus flow predictors vs detached encoder targets, SIGReg anti-collapse, reward plus termination plus recon-debug plus real-value grounding,
    - `train_agent()`: imagine chunks with `world.generate_chunk()` in `flow` or `ar` mode, update value ensemble + actor,
    - `evaluate()`: deterministic rollout + TensorBoard video,
    - every 250 agent steps: full diagnostics dump to `runs/.../diagnostics/`.
@@ -173,22 +174,22 @@ What you get in `runs/<domain>_<task>_analytical_ent..._seed42_<timestamp>/`:
 
 | Piece | File | Key choice |
 |---|---|---|
-| Vision CNN | `models/world_helpers.py:8` | 16→32→64 conv + BatchNorm + GAP → SwiGLU → LayerNorm, 256-D |
+| Vision CNN | `models/world_helpers.py:8` | 16→32→64 conv + BatchNorm + GAP → SwiGLU → LayerNorm, 256-D. Context encoder; targets are stop-grad encoder outputs |
 | Vision DINOv3 | `models/world_helpers.py:59` | `facebook/dinov3-vits16-pretrain-lvd1689m`, frozen backbone, BatchNorm projection |
-| AR dynamics | `models/dynamics.py:12` | 6-layer AdaLN Transformer, causal, KV-cache for `step_world` |
-| Flow dynamics | `models/dynamics.py:88` | 3-layer cross-attention `FutureFlowBlock`, RoPE, AdaLN-Zero, Euler/RK4/Dopri5, CFG, latent standardisation via `RunningMeanStd` |
+| AR predictor | `models/dynamics.py:12` | 6-layer AdaLN Transformer, causal, KV-cache for `step_world`. Predicts next latents vs detached targets (`train.py:829`) |
+| Flow predictor | `models/dynamics.py:88` | 3-layer cross-attention `FutureFlowBlock`, RoPE, AdaLN-Zero, Euler/RK4/Dopri5, CFG, latent standardisation via `RunningMeanStd` |
 | Reward / Term | `models/world_helpers.py:135,164` | SwiGLU MLPs; term is BCE-with-logits |
-| Decoder (debug) | `models/world_helpers.py:193` | ConvTranspose 4×4→64×64, MSE recon loss, visualises real vs Euler vs AR |
+| Decoder (debug only) | `models/world_helpers.py:193` | ConvTranspose 4×4→64×64, MSE recon loss, visualises real vs Euler vs AR. Excluded from the JEPA representation objective |
 | Actor | `models/agent.py:30` | Transformer chunk policy: ctx → 1 + H tokens → `Normal(mean, std)` → tanh squash, `H=world_horizon` |
 | Value | `models/agent.py:185` | **5-head ensemble**, SwiGLU ResNet MLPs, dropout 0.01, min/mean reduction, symlog λ-returns |
-| Regulariser | `losses.py:6,37` | `SIGReg` (Epps-Pulley characteristic test) → replaced by cheaper `WeakSIGReg`: `‖Cov(z)−I‖_F` |
+| Anti-collapse regulariser | `losses.py:6,37` | JEPA: `SIGReg` (Epps-Pulley characteristic test) → cheaper `WeakSIGReg`: `‖Cov(z)−I‖_F` on encoder latents (`train.py:906`) |
 | Augment | `models/augmentations.py` | sequence-consistent `random_shift(pad=3)`, colour jitter, sensor noise, 50 % time-reversal (`obs.flip + act.neg`) |
 
-World training (`train.py:train_world`):
+World training (`train.py:train_world`) — JEPA latent prediction:
 
-- clean labels for reward/term (never flipped by time-sym), dynamics sees augmented views,
-- AR loss = MSE to detached encoder targets,
-- flow loss = `0.1 * (CFM velocity MSE + 0.02*cos)` + optional consistency `0.001 * MSE(view1, view2)`,
+- predictors regress detached encoder targets (no pixel reconstruction in the objective): AR loss = MSE to detached encoder targets, flow loss = `0.1 * (CFM velocity MSE + 0.02*cos)` + optional consistency `0.001 * MSE(view1, view2)`,
+- `SIGReg` / `WeakSIGReg` anti-collapse on encoder latents, dynamics sees augmented views,
+- clean labels for reward/term (never flipped by time-sym),
 - reward grounding on real + AR-teacher-forced + flow-Euler states, term likewise,
 - value grounding on real history windows with conservative min-target,
 - per-loss grad-norm logging before the combined step.
@@ -221,7 +222,7 @@ Agent training:
 | # | Tried | Result | Verdict |
 |---|---|---|---|
 | 1 | Pure analytical gradients through flow imagination | FD cosine often **< 0.5**, 1D slice doesn't descend along `-grad`, `flow_action_impact` flat | **Failing** — WM gradient misleads actor; action conditioning is weak |
-| 1b | Full BPTT through AR chain | Chaotic / exploding actor grads from compounded Jacobians | **Failed** — motivated chunk + flow |
+| 1b | Full BPTT through AR dynamics | Unstable, exploding actor grads from compounded Jacobians | **Failed** — motivated chunk + flow |
 | 1c | Disconnected stop-grad per step | Stable but too local, no long-horizon credit | **Failed** — too myopic |
 | 1d | Single-pass chunk predictor (no ODE) | Mapping too non-linear, never learned | **Failed** — motivated flow matching |
 | 2 | Flow-only world (no AR) | Trajectory collapse / mode averaging: all futures converge | **Failed** — needed dual dynamics |
