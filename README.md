@@ -22,11 +22,26 @@
 - As a result, analytical gradients through imagined trajectories were often poorly aligned with useful policy-improvement directions.
 - Several attempted fixes — including longer horizons, alternative ODE solvers, entropy sweeps, DINOv3 features, and different value-learning schemes — did not resolve the underlying action-conditioning problem.
 
+## How this project started, and what came next
+
+**Where it came from.** I was training a PPO policy for a drone-racing competition. It cleared the first three gates before crashing, and I expected it could be pushed further. But the competition simulator could not easily run in parallel, so collecting experience in it would be slow. There were two ways around that, and both replace the slow simulator with a proxy. **Sim-to-sim transfer** trains in a fast simulator and adapts to the competition one. A **world model** learns the competition simulator's dynamics and becomes a fast, parallel copy of it, learned from that simulator's own data. Sim-to-sim would probably have worked. The world model was the more open question, and the one where I could contribute something.
+
+**Why Cartpole.** Before trying it on a drone, I wanted to know whether the approach worked at all on a much smaller problem.
+
+**The idea.** A JEPA-style world model (inspired by [LeWorldModel](https://github.com/lucas-maes/le-wm)) predicts chunks of future latents. A policy outputs matching chunks of actions. Value is backpropagated through the value, reward and world models into the policy.
+
+**Why backpropagate through the world model.** If the world model knows what will happen next, it should be able to train the policy directly from that knowledge. The gradient says how each action should change to raise the return. MPC planners like CEM sample many random action sequences and keep the best ones, and policy-gradient methods learn from sampled actions and their returns. A differentiable model could skip that sampling, as long as its gradients are accurate and respond to the actions.
+
+**What went wrong.** Predicting several timesteps in one pass was hard for the world model, so I turned to flow matching (§1). The flow model then largely ignored the actions, collapsed toward average futures, and its objective seemed to work against the JEPA representation objective (§7, §8). Direct gradients also brought their own problems. The value function overestimated returns in regions the world model had not seen, which I tried to contain with a value ensemble and other fixes. Too many things needed fixing at once.
+
+**What came next.** I decided to fix one thing first: the world model. I wanted the encoder and the flow predictor trained **jointly**, because a jointly trained model can be applied to any environment without a separate pretraining stage. So the narrower question became: can flow matching and a JEPA encoder be trained together at all? That became [Flow-Matching JEPA](https://github.com/DivyamChandalia/flow-matching-jepa), an extension of LeWorldModel on Push-T. There, joint training reproduced the same action-ignoring collapse, while a **frozen** encoder with a residual flow head stayed action-sensitive and cut 3-step rollout error from 0.120 to 0.037. [Flow-JEPA](https://github.com/HuoYanchen/Flow-JEPA), a published method that generates multi-step latent chunks with flow matching much like this repo's chunked imagination, also uses a frozen pretrained encoder for Push-T. My reproduction of it, trained jointly from scratch, collapsed the same way. The open question for this repo is therefore narrower than when it started: how to keep the encoder stable enough, for example with an EMA target encoder, that a flow predictor has to use its actions.
+
 ---
 
 ## Table of contents
 
 - [Key findings](#key-findings)
+- [How this project started, and what came next](#how-this-project-started-and-what-came-next)
 - [1. Motivation](#1-motivation--why-flow-based-imagination)
 - [2. How it works (30 seconds)](#2-how-it-works-30-seconds)
 - [3. Repo layout](#3-repo-layout)
@@ -300,7 +315,7 @@ Condensed from `git log` (oldest → newest). Each line was a hypothesis:
 - `8d9cf78`–`cb30cc0` dual-dynamics cleanup
 - `16c2a22`–`6f558c6`–`56fc096` history-window + Cartpole termination + freeze_world
 - `8dc8932` CFM/Euler hybrid + augmentations + view consistency → `ccb568e` time-symmetry → `b0cd014` time-sym fixes → `1bd40eb` double-discount fix
-- `ef83672` DINOv3 encoder → `0577348` removed over-complex value suppression → `f23c265` LayerNorm→BatchNorm → `a49fb65` PCA diagnostics → `58b945c`/`1fd5c5f` TD-MPC2 value ensemble (current `feature/grounded-value`)
+- `ef83672` DINOv3 encoder → `0577348` removed over-complex value suppression → `f23c265` LayerNorm→BatchNorm → `a49fb65` PCA diagnostics → `58b945c`/`1fd5c5f` TD-MPC2 value ensemble (merged into `main` in `0b1c4e9`)
 
 Naming convention in `runs/` encodes the sweep: `cartpole_swingup_analytical_ent0.006_alr8e-05_..._wh3_ah3_sig0.01_weaksig_seed42_<timestamp>` — ~100 runs varying `entropy`, `world_horizon (wh)`, `sigreg`, `task`.
 
@@ -372,15 +387,15 @@ All in `train.py:Config`. The ones that actually matter:
 
 | Branch | Purpose |
 |---|---|
-| `main` | stable-ish baseline |
-| `feature/grounded-value` *(current)* | value ensemble + grounded real-value loss |
+| `main` *(current, default)* | stable baseline, includes merged value ensemble |
+| `feature/grounded-value` | value ensemble + grounded real-value loss — merged into `main` in `0b1c4e9`, branch now stale |
 | `feature/dual-dynamics` | AR + flow side-by-side |
 | `feature/flow-matching-dynamics` | early flow-only experiments |
 | `debug/actor-loss-landscape` | landscape / grad-flow / action-monitor toolkit |
 | `chunked` | chunked actor rollout |
 | `reinforce` | REINFORCE reference path |
 
-If you're new, start from `feature/grounded-value` and diff against `main` — the diff is mostly simplification + ensemble.
+If you're new, start from `main` — the feature branches below are historical experiments, mostly already merged or superseded.
 
 ---
 
